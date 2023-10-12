@@ -14,6 +14,7 @@ class InterpLvar(InterpLint):
     match s:
       case Assign([Name(id)], value):
         env[id] = self.interp_exp(value, env)
+        # open recursion
         return self.interp_stmts(cont, env)
       case _:
         return super().interp_stmt(s, env, cont)
