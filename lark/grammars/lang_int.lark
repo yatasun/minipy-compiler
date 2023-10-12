@@ -1,0 +1,21 @@
+
+%import common.INT
+%import common.NEWLINE
+
+exp: exp "+" exp_hi      -> add
+    | exp "-" exp_hi     -> sub
+    | exp_hi
+
+exp_hi: INT                 -> int
+    | "input_int" "("")"    -> input_int
+    | "-" exp_hi            -> usub
+    | "(" exp ")"           -> paren
+
+
+stmt: "print" "(" exp ")"   -> print
+    | exp                   -> expr
+
+stmt_list:                      -> empty_stmt
+    | stmt NEWLINE stmt_list    -> add_stmt
+
+lang_int: stmt_list     -> module
