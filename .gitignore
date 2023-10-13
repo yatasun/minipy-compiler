@@ -1,2 +1,5 @@
 **/__pycache__/
 /runtime.o
+*.out
+*.out.*dSYM
+log.txt

@@ -118,7 +118,10 @@ class Compiler:
                     case Constant(_) | Name(_) as atm:
                         return [Instr("movq", [self.select_arg(atm), Variable(var)])]
                     case UnaryOp(USub(), atm):
-                        return [Instr('movq', [self.select_arg(atm), Variable(var)]), Instr('negq', [Variable(var)])]
+                        return [
+                            Instr("movq", [self.select_arg(atm), Variable(var)]),
+                            Instr("negq", [Variable(var)]),
+                        ]
                     case BinOp(atm1, Add(), atm2):
                         arg1, arg2 = self.select_arg(atm1), self.select_arg(atm2)
                         lhs = Variable(var)
@@ -129,7 +132,7 @@ class Compiler:
                         else:
                             return [
                                 Instr("movq", [arg1, lhs]),
-                                Instr("addq", [arg2, lhs])
+                                Instr("addq", [arg2, lhs]),
                             ]
                     case BinOp(atm1, Sub(), atm2):
                         arg1, arg2 = self.select_arg(atm1), self.select_arg(atm2)
@@ -137,23 +140,22 @@ class Compiler:
                         if lhs == arg1:
                             return [Instr("subq", [arg2, lhs])]
                         elif lhs == arg2:
-                            return [
-                                Instr("negq", [lhs]),
-                                Instr("addq", [arg1, lhs])
-                            ]
+                            return [Instr("negq", [lhs]), Instr("addq", [arg1, lhs])]
                         else:
                             return [
                                 Instr("movq", [arg1, lhs]),
-                                Instr("subq", [arg2, lhs])
+                                Instr("subq", [arg2, lhs]),
                             ]
                     case Call(Name("input_int"), []):
                         return [
                             Callq(label_name("read_int"), 0),
-                            Instr("movq", [Reg("rax"), Variable(var)])
+                            Instr("movq", [Reg("rax"), Variable(var)]),
                         ]
 
                     case _:
-                        raise Exception("select_stmt_assign unexpected exp: " + repr(exp))
+                        raise Exception(
+                            "select_stmt_assign unexpected exp: " + repr(exp)
+                        )
             case _:
                 raise Exception("select_stmt_assign unexpected: " + repr(s))
 
@@ -180,8 +182,8 @@ class Compiler:
                 if var in home:
                     return home[var]
                 else:
-                    self.stack_size += 8
-                    home[var] = Deref("rbp", -self.stack_size)
+                    self.spilled_size += 8
+                    home[var] = Deref("rbp", -self.spilled_size)
                     return home[var]
             case _:
                 raise Exception("assign_homes_arg unexpected " + repr(a))
@@ -191,16 +193,22 @@ class Compiler:
             case Instr(op, [arg]):
                 return Instr(op, [self.assign_homes_arg(arg, home)])
             case Instr(op, [arg1, arg2]):
-                return Instr(op, [self.assign_homes_arg(arg1, home), self.assign_homes_arg(arg2, home)])
+                return Instr(
+                    op,
+                    [
+                        self.assign_homes_arg(arg1, home),
+                        self.assign_homes_arg(arg2, home),
+                    ],
+                )
             case Callq(_, _):
                 return i
             case _:
                 raise Exception("assign_homes_instr unexpected " + repr(i))
 
     def assign_homes(self, p: X86Program) -> X86Program:
-        self.stack_size = 0
+        self.spilled_size = 0
         home = {}
-        return X86Program([self.assign_homes_instr(i, home) for i in p.body]) # type: ignore
+        return X86Program([self.assign_homes_instr(i, home) for i in p.body])  # type: ignore
 
     ############################################################################
     # Patch Instructions
@@ -209,10 +217,7 @@ class Compiler:
     def patch_instr(self, i: instr) -> List[instr]:
         match i:
             case Instr(op, [Immediate(n) as imm]) if n > 2**16:
-                return [
-                    Instr("movq", [imm, Reg("rax")]),
-                    Instr(op, [Reg("rax")])
-                ]
+                return [Instr("movq", [imm, Reg("rax")]), Instr(op, [Reg("rax")])]
             case Instr(op, [_]):
                 return [i]
             case Instr(op, [arg1, arg2]):
@@ -220,18 +225,18 @@ class Compiler:
                     case (Deref(_, _) as deref1, Deref(_, _) as deref2):
                         return [
                             Instr("movq", [deref1, Reg("rax")]),
-                            Instr(op, [Reg("rax"), deref2])
+                            Instr(op, [Reg("rax"), deref2]),
                         ]
                     case (Immediate(n) as imm, _) if n > 2**16:
                         return [
                             Instr("movq", [imm, Reg("rax")]),
-                            Instr(op, [Reg("rax"), arg2])
+                            Instr(op, [Reg("rax"), arg2]),
                         ]
                     # TODO: 存在这种情况吗？
                     case (_, Immediate(n) as imm) if n > 2**16:
                         return [
                             Instr("movq", [imm, Reg("rax")]),
-                            Instr(op, [arg1, Reg("rax")])
+                            Instr(op, [arg1, Reg("rax")]),
                         ]
                     case _:
                         return [i]
@@ -241,20 +246,29 @@ class Compiler:
                 raise Exception("patch_instr unexpected: " + repr(i))
 
     def patch_instructions(self, p: X86Program) -> X86Program:
-        return X86Program([ni for i in p.body for ni in self.patch_instr(i)]) # type: ignore
+        return X86Program([ni for i in p.body for ni in self.patch_instr(i)])  # type: ignore
 
     ############################################################################
     # Prelude & Conclusion
     ############################################################################
 
     def prelude_and_conclusion(self, p: X86Program) -> X86Program:
-        new_body =  [
-            Instr("pushq", [Reg("rbp")]),
-            Instr("movq", [Reg("rsp"), Reg("rbp")]),
-            Instr("subq", [Immediate(self.stack_size), Reg("rsp")]),
-        ] + p.body + [ # type: ignore
-            Instr("addq", [Immediate(self.stack_size), Reg("rsp")]),
-            Instr("popq", [Reg("rbp")]),
-            Instr("retq", [])
-        ]
+        new_body = (
+            [
+                Instr("pushq", [Reg("rbp")]),
+                Instr("movq", [Reg("rsp"), Reg("rbp")]),
+                # return address + pushq rbp 已经使得 rsp 按 16 byte 对齐.
+                Instr(
+                    "subq", [Immediate(align(self.spilled_size, 16)), Reg("rsp")]
+                ),
+            ]
+            + p.body  # type: ignore
+            + [
+                Instr(
+                    "addq", [Immediate(align(self.spilled_size, 16)), Reg("rsp")]
+                ),
+                Instr("popq", [Reg("rbp")]),
+                Instr("retq", []),
+            ]
+        )
         return X86Program(new_body)

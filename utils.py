@@ -1151,6 +1151,12 @@ def is_python_extension(filename):
 # Given the `ast` output of a pass and a test program (root) name,
 # runs the interpreter on the program and compares the output to the
 # expected "golden" output.
+
+# passname: name of the pass being tested
+# interp_dict: dictionary mapping passnames to interpreter
+# program_root: test file root name
+# ast: Python AST
+# compiler_name: name of the compiler being tested
 def test_pass(passname, interp_dict, program_root, ast,
               compiler_name):
     if passname in interp_dict.keys():
@@ -1558,6 +1564,13 @@ def compile(compiler, compiler_name, type_check_L, type_check_C,
 # C intermediate language, run all the passes in the compiler,
 # checking that the resulting programs produce output that matches the
 # golden file.
+
+# test: the name of the test file
+# lang: the name of the language
+# compiler: the tested compiler instance
+# compiler_name: the name of the tested compiler
+# type_check_dict: a dictionary mapping pass names to type checkers
+# interp_dict: a dictionary mapping pass names to interpreters
 def run_one_test(test, lang, compiler, compiler_name,
                  type_check_dict, interp_dict):
 #    test_root = os.path.splitext(test)[0]
