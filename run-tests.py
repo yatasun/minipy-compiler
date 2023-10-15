@@ -8,7 +8,7 @@ sys.path.append('../iucompiler')
 sys.path.append('../iucompiler/interp_x86')
 
 import compiler
-import compiler_register_allocator
+import compiler_if
 import interp_Lvar
 import type_check_Lvar
 from utils import run_tests, run_one_test, enable_tracing
@@ -17,7 +17,7 @@ from interp_x86.eval_x86 import interp_x86
 enable_tracing()
 
 # compiler = compiler.Compiler()
-compiler = compiler_register_allocator.Compiler()
+compiler = compiler_if.Compiler()
 
 typecheck_Lvar = type_check_Lvar.TypeCheckLvar().type_check
 
