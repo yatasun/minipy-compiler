@@ -399,7 +399,7 @@ class Compiler(compiler_register_allocator.Compiler):
 
     def uncover_live_inner_bb(
         self, ss: List[instr], live_before_block: Dict[str, Set[location]]
-    ) -> Dict[instr, Set[location]]:
+    ) -> Tuple[Dict[instr, Set[location]], Dict[instr, Set[location]]]:
         live_before = {i: set() for i in range(len(ss))}
         live_after = {i: set() for i in range(len(ss))}
         match ss[len(ss) - 1]:
@@ -426,7 +426,9 @@ class Compiler(compiler_register_allocator.Compiler):
             if i - 1 >= 0:
                 live_after[i - 1] = live_before[i]
 
-        return {inst: live_after[i] for i, inst in enumerate(ss)}
+        result_live_before =  {inst: live_before[i] for i, inst in enumerate(ss)}
+        result_live_after =  {inst: live_after[i] for i, inst in enumerate(ss)}
+        return (result_live_before, result_live_after)
 
     # 基于 cfg 来做 liveness 分析
     def uncover_live(self, p: X86Program) -> Dict[instr, Set[location]]:
@@ -447,8 +449,8 @@ class Compiler(compiler_register_allocator.Compiler):
                 live_before_block[label] = set([Reg("rax"), Reg("rsp")])
                 continue
 
-            live_after_inner_bb = self.uncover_live_inner_bb(stmts, live_before_block)
-            live_before_block[label] = live_after_inner_bb[stmts[0]]
+            live_before_inner_bb, live_after_inner_bb = self.uncover_live_inner_bb(stmts, live_before_block)
+            live_before_block[label] = live_before_inner_bb[stmts[0]]
             live_after.update(live_after_inner_bb)
 
         return live_after
