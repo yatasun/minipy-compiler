@@ -262,13 +262,14 @@ class Compiler(compiler_register_allocator.Compiler):
                 # print(f"======Expr(value): {value}")
                 return self.explicate_effect(value, cont, basic_blocks)
             case If(test, body, orelse):
+                # print(f"====If stmt: {s}")
                 goto_cont = self.create_block(cont, basic_blocks)
                 body_ss = goto_cont
                 for s in reversed(body):
-                    self.explicate_stmt(s, body_ss, basic_blocks)
+                    body_ss = self.explicate_stmt(s, body_ss, basic_blocks)
                 orelse_ss = goto_cont
                 for s in reversed(orelse):
-                    self.explicate_stmt(s, orelse_ss, basic_blocks)
+                    orelse_ss = self.explicate_stmt(s, orelse_ss, basic_blocks)
                 return self.explicate_pred(test, body_ss, orelse_ss, basic_blocks)
             case _:
                 raise Exception("explicate_stmt unexpected: " + repr(s))

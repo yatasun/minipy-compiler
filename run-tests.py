@@ -50,7 +50,7 @@ if True:
               typecheck_dict,
               interp_dict)
 else:
-    run_one_test(os.getcwd() + '/tests/if/my1.py',
+    run_one_test(os.getcwd() + '/tests/if/my4.py',
                  'if',
                  compiler,
                  'if',

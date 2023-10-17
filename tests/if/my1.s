@@ -1,33 +1,33 @@
 	.align 16
-_block.1:
+_block.4:
     movq %rbx, %rdi
     callq _print_int
     movq $0, %rax
     jmp _conclusion
 
 	.align 16
-_block.2:
+_block.5:
     movq $2, %rbx
-    jmp _block.1
+    jmp _block.4
 
 	.align 16
-_block.3:
+_block.6:
     movq $3, %rbx
-    jmp _block.1
+    jmp _block.4
 
 	.align 16
-_block.4:
+_block.7:
     movq $1, %rax
     cmpq $1, %rax
-    je _block.2
-    jmp _block.3
+    je _block.5
+    jmp _block.6
 
 	.align 16
 _start:
     movq $1, %rbx
     cmpq $1, %rbx
-    je _block.4
-    jmp _block.3
+    je _block.7
+    jmp _block.6
 
 	.align 16
 _conclusion:
