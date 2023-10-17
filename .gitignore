@@ -4,4 +4,4 @@
 *.out.*dSYM
 log.txt
 test-*
-./tests/if/*.s
+tests/**/*.s
