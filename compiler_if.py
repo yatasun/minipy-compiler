@@ -444,7 +444,7 @@ class Compiler(compiler_register_allocator.Compiler):
         for label in rtopo_order:
             stmts = basic_blocks[label]
             if label == label_name("conclusion"):
-                live_before_block[label] = set()
+                live_before_block[label] = set([Reg("rax"), Reg("rsp")])
                 continue
 
             live_after_inner_bb = self.uncover_live_inner_bb(stmts, live_before_block)
