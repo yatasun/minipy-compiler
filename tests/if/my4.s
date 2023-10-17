@@ -5,12 +5,24 @@ _block.0:
 
 	.align 16
 _block.1:
-    movq $2, %rdi
+    movq $1, %rdi
     callq _print_int
     jmp _block.0
 
 	.align 16
 _block.2:
+    movq $2, %rdi
+    callq _print_int
+    jmp _block.0
+
+	.align 16
+_block.3:
+    cmpq %rbx, %r12
+    jl _block.1
+    jmp _block.2
+
+	.align 16
+_block.4:
     movq $3, %rdi
     callq _print_int
     jmp _block.0
@@ -18,15 +30,19 @@ _block.2:
 	.align 16
 _start:
     callq _read_int
+    movq %rax, %r13
+    callq _read_int
     movq %rax, %r12
     callq _read_int
     movq %rax, %rbx
-    cmpq %rbx, %r12
-    jl _block.1
-    jmp _block.2
+    cmpq %r12, %r13
+    jl _block.3
+    jmp _block.4
 
 	.align 16
 _conclusion:
+    addq $8, %rsp
+    popq %r13
     popq %r12
     popq %rbx
     popq %rbp
@@ -39,6 +55,8 @@ _main:
     movq %rsp, %rbp
     pushq %rbx
     pushq %r12
+    pushq %r13
+    subq $8, %rsp
     jmp _start
 
 
