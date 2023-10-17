@@ -2,10 +2,10 @@
 _main:
     pushq %rbp
     movq %rsp, %rbp
-    pushq %rbx
+    pushq %r12
     pushq %r13
     pushq %r14
-    pushq %r12
+    pushq %rbx
     callq _read_int
     movq %rax, %rbx
     callq _read_int
@@ -18,10 +18,10 @@ _main:
     addq %r14, %rbx
     movq %rbx, %rdi
     callq _print_int
-    popq %r12
+    popq %rbx
     popq %r14
     popq %r13
-    popq %rbx
+    popq %r12
     popq %rbp
     retq 
 

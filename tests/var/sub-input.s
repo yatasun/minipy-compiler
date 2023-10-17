@@ -2,8 +2,8 @@
 _main:
     pushq %rbp
     movq %rsp, %rbp
-    pushq %rbx
     pushq %r12
+    pushq %rbx
     callq _read_int
     movq %rax, %rbx
     callq _read_int
@@ -11,8 +11,8 @@ _main:
     subq %r12, %rbx
     movq %rbx, %rdi
     callq _print_int
-    popq %r12
     popq %rbx
+    popq %r12
     popq %rbp
     retq 
 

@@ -71,7 +71,7 @@ def is_not_reg_alloc_reg(r: str) -> bool:
 
 def islocation(a: arg) -> bool:
     match a:
-        case Variable(_) | Reg(_):
+        case Variable(_) | Reg(_) | ByteReg(_):
             return True
         case _:
             return False
@@ -79,7 +79,7 @@ def islocation(a: arg) -> bool:
 
 def arg_to_locations(a: arg) -> Set[location]:
     match a:
-        case Variable(_) | Reg(_):
+        case Variable(_) | Reg(_) | ByteReg(_):
             return {a}
         case _:
             return set()
@@ -179,13 +179,6 @@ class Compiler(compiler.Compiler):
                         for v in live_after[inst]:  # type: ignore
                             if v != d:
                                 g.add_edge(d, v)
-            # match inst:
-            #     case Callq(_, _):
-            #         for v in live_after[inst]:
-            #             for r in caller_saved_regs:
-            #                 g.add_edge(v, Reg(r))
-            #     case _:
-            #         pass
 
         return g
 
@@ -326,25 +319,19 @@ class Compiler(compiler.Compiler):
         used_callee_size = len(self.used_callee) * 8
         rsp_aligned = align(self.spilled_size + used_callee_size, 16) - used_callee_size
 
-        new_body = (
-            [
-                Instr("pushq", [Reg("rbp")]),
-                Instr("movq", [Reg("rsp"), Reg("rbp")]),
-            ]
-            + [Instr("pushq", [Reg(r)]) for r in self.used_callee]
-        )
+        new_body = [
+            Instr("pushq", [Reg("rbp")]),
+            Instr("movq", [Reg("rsp"), Reg("rbp")]),
+        ] + [Instr("pushq", [Reg(r)]) for r in self.used_callee]
         if rsp_aligned > 0:
             new_body += [Instr("subq", [Immediate(rsp_aligned), Reg("rsp")])]
         new_body += p.body  # type: ignore
         if rsp_aligned > 0:
             new_body += [Instr("addq", [Immediate(rsp_aligned), Reg("rsp")])]
-        new_body += (
-            [Instr("popq", [Reg(r)]) for r in reversed(self.used_callee)]
-            + [
-                Instr("popq", [Reg("rbp")]),
-                Instr("retq", []),
-            ]
-        )
+        new_body += [Instr("popq", [Reg(r)]) for r in reversed(self.used_callee)] + [
+            Instr("popq", [Reg("rbp")]),
+            Instr("retq", []),
+        ]
         return X86Program(new_body)  # type: ignore
 
 

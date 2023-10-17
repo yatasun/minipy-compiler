@@ -106,8 +106,8 @@ class Compiler:
             # side effect
             case Expr(Call(Name("input_int"), [])):
                 return [Callq(label_name("read_int"), 0)]
-            case Assign([Name(var)], exp) as assign:
-                return self.select_stmt_assign(assign)
+            case Assign([Name(_)], _):
+                return self.select_stmt_assign(s)
             case _:
                 raise Exception("select_stmt unexpected: " + repr(s))
 
@@ -203,7 +203,8 @@ class Compiler:
             case Callq(_, _):
                 return i
             case _:
-                raise Exception("assign_homes_instr unexpected " + repr(i))
+                return i
+                # raise Exception("assign_homes_instr unexpected " + repr(i))
 
     def assign_homes(self, p: X86Program) -> X86Program:
         self.spilled_size = 0
@@ -243,7 +244,8 @@ class Compiler:
             case Callq(_, _):
                 return [i]
             case _:
-                raise Exception("patch_instr unexpected: " + repr(i))
+                return [i]
+                # raise Exception("patch_instr unexpected: " + repr(i))
 
     def patch_instructions(self, p: X86Program) -> X86Program:
         return X86Program([ni for i in p.body for ni in self.patch_instr(i)])  # type: ignore

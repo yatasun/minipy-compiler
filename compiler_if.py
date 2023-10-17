@@ -1,321 +1,541 @@
-import compiler
-from graph import UEdge, UndirectedAdjList
-from typing import List, Tuple, Set, Dict
 from ast import *
+from ast import Assign, List, Module, Set, arg, expr, stmt, cmpop
+import select
+from compiler import Temporaries
+import compiler_register_allocator
+from compiler_register_allocator import *
+from graph import DirectedAdjList, Vertex, topological_sort, transpose
+from utils import Assign, List, Module
 from x86_ast import *
-from typing import Set, Dict, Tuple
-from priority_queue import PriorityQueue
-from utils import align
+from utils import *
+from typing import List, Tuple, Set, Dict
 
-# Skeleton code for the chapter on Register Allocation
-
-caller_saved_regs = ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"]
-callee_saved_regs = ["rsp", "rbp", "rbx", "r12", "r13", "r14", "r15"]
-# argument_passing_regs is a subset of caller_saved_regs
-arg_passing_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
-
-id_to_regs = {
-    # 0: "rcx",
-    # 1: "rdx",
-    # 2: "rsi",
-    # 3: "rdi",
-    # 4: "r8",
-    # 5: "r9",
-    # 6: "r10",
-    # 7: "rbx",
-    # 8: "r12",
-    # 9: "r13",
-    # 10: "r14",
-    0: "rbx",
-    1: "r12",
-    2: "r13",
-    3: "r14",
-}
-not_reg_alloc_regs = {
-    -1: "rax",
-    -2: "rsp",
-    -3: "rbp",
-    -4: "r11",
-    -5: "r15",
-    -6: "rcx",
-    -7: "rdx",
-    -8: "rsi",
-    -9: "rdi",
-    -10: "r8",
-    -11: "r9",
-    -12: "r10",
-}
+from x86_ast import X86Program, arg, instr, location
 
 
-def id_to_reg(i: int) -> str:
-    if i in id_to_regs:
-        return id_to_regs[i]
-    if i in not_reg_alloc_regs:
-        return not_reg_alloc_regs[i]
-    raise Exception(f"id_to_reg: invalid id: {i}")
-
-
-def reg_to_id(r: str) -> int:
-    for k, v in id_to_regs.items():
-        if v == r:
-            return k
-    for k, v in not_reg_alloc_regs.items():
-        if v == r:
-            return k
-    raise Exception(f"reg_to_id: invalid reg: {r}")
-
-
-def is_not_reg_alloc_reg(r: str) -> bool:
-    return r in not_reg_alloc_regs.values()
-
-
-def islocation(a: arg) -> bool:
-    match a:
-        case Variable(_) | Reg(_):
-            return True
+def cmpop_to_cc(cmp: cmpop) -> str:
+    match cmp:
+        case Eq():
+            return "e"
+        case NotEq():
+            return "ne"
+        case Lt():
+            return "l"
+        case LtE():
+            return "le"
+        case Gt():
+            return "ne"
+        case GtE():
+            return "ge"
         case _:
-            return False
+            raise Exception("cmpop_to_cc unexpected: " + repr(cmp))
 
 
-def arg_to_locations(a: arg) -> Set[location]:
-    match a:
-        case Variable(_) | Reg(_):
-            return {a}
-        case _:
-            return set()
+class Compiler(compiler_register_allocator.Compiler):
+    ############################################################################
+    # Shrink
+    ############################################################################
 
+    # L_If -> L_If(without `and`, `or`)
+    # desugar
 
-class Compiler(compiler.Compiler):
+    def shrink_exp(self, e: expr) -> expr:
+        match e:
+            case Constant(_) | Name(_) | Call(Name("input_int"), []):
+                return e
+            case UnaryOp(op, exp):
+                return UnaryOp(op, self.shrink_exp(exp))
+            case BinOp(exp1, op, exp2):
+                return BinOp(self.shrink_exp(exp1), op, self.shrink_exp(exp2))
+
+            # desugar `and`, `or`
+            case BoolOp(And(), [exp1, exp2]):
+                return IfExp(
+                    self.shrink_exp(exp1), self.shrink_exp(exp2), Constant(False)
+                )
+            case BoolOp(Or(), [exp1, exp2]):
+                return IfExp(
+                    self.shrink_exp(exp1), Constant(True), self.shrink_exp(exp2)
+                )
+
+            case IfExp(exp1, exp2, exp3):
+                return IfExp(
+                    self.shrink_exp(exp1), self.shrink_exp(exp2), self.shrink_exp(exp3)
+                )
+            case Compare(left, [cmp], [right]):
+                return Compare(self.shrink_exp(left), [cmp], [self.shrink_exp(right)])
+            case _:
+                raise Exception("shrink_exp unexpected: " + repr(e))
+
+    def shrink_stmt(self, s: stmt) -> stmt:
+        match s:
+            # 处理 subexpression
+            case Expr(Call(Name("print"), [exp])):
+                return Expr(Call(Name("print"), [self.shrink_exp(exp)]))
+            case Expr(e):
+                return Expr(self.shrink_exp(e))
+            case Assign([Name(var)], exp):
+                return Assign([Name(var)], self.shrink_exp(exp))
+            case If(exp, body, orelse):
+                return If(
+                    self.shrink_exp(exp),
+                    [self.shrink_stmt(ss) for ss in body],
+                    [self.shrink_stmt(ss) for ss in orelse],
+                )
+            case _:
+                raise Exception("shrink_stmt unexpected: " + repr(s))
+
+    def shrink(self, p: Module) -> Module:
+        return Module([self.shrink_stmt(s) for s in p.body])
+
+    ############################################################################
+    # Remove Complex Operands
+    ############################################################################
+
+    # L_If(without `and`, `or`) -> L_If^mon
+
+    def rco_exp(self, e: expr, need_atomic: bool) -> Tuple[expr, Temporaries]:
+        result_expr = expr()
+        result_temps = []
+        match e:
+            case Compare(left, [cmp], [right]):
+                (new_left, temps1) = self.rco_exp(left, True)
+                (new_right, temps2) = self.rco_exp(right, True)
+                result_expr, result_temps = (
+                    Compare(new_left, [cmp], [new_right]),
+                    temps1 + temps2,
+                )
+            case IfExp(test, body, orelse):
+                (new_test, temps1) = self.rco_exp(test, False)
+                (new_body, temps2) = self.rco_exp(body, False)
+                (new_orelse, temps3) = self.rco_exp(orelse, False)
+
+                # Begin 适合处理嵌套 if expression 的情况.
+                then_branch = make_begin(temps2, new_body)
+                else_branch = make_begin(temps3, new_orelse)
+                result_expr, result_temps = (
+                    IfExp(new_test, then_branch, else_branch),
+                    temps1,
+                )
+
+            case _:
+                return super().rco_exp(e, need_atomic)  # type: ignore
+        if need_atomic:
+            tmp = generate_name("tmp")
+            result_expr, result_temps = Name(tmp), result_temps + [
+                (Name(tmp), result_expr)
+            ]
+        return (result_expr, result_temps)
+
+    def rco_stmt(self, s: stmt) -> List[stmt]:
+        match s:
+            case If(exp, body, orelse):
+                new_exp, temps = self.rco_exp(exp, False)
+                new_body = [new_ss for ss in body for new_ss in self.rco_stmt(ss)]
+                new_orelse = [new_ss for ss in orelse for new_ss in self.rco_stmt(ss)]
+                return make_assigns(temps) + [If(new_exp, new_body, new_orelse)]  # type: ignore
+            case _:
+                return super().rco_stmt(s)
+
+    ############################################################################
+    # Explicate Control
+    ############################################################################
+
+    # L_If^mon -> C_If
+
+    def create_block(
+        self, stmts: List[stmt], basic_block: Dict[str, List[stmt]]
+    ) -> List[stmt]:
+        match stmts:
+            case [Goto(l)]:
+                return stmts
+            case _:
+                label = label_name(generate_name("block"))
+                basic_block[label] = stmts
+                return [Goto(label)]
+
+    # generates code for an if expression or statement by analyzing the condition expression
+    # 返回 `stmt` ... If(Compare(atm, [cmp], [atm]), [Goto(label)], [Goto(label)])
+    def explicate_pred(
+        self, cnd, thn, els, basic_blocks: Dict[str, List[stmt]]
+    ) -> List[stmt]:
+        match cnd:
+            case Compare(left, [op], [right]):
+                goto_thn = self.create_block(thn, basic_blocks)
+                goto_els = self.create_block(els, basic_blocks)
+                return [If(cnd, goto_thn, goto_els)]
+            case Constant(True):
+                return thn
+            case Constant(False):
+                return els
+            case UnaryOp(Not(), operand):
+                return self.explicate_pred(operand, els, thn, basic_blocks)
+            # y+2 if (x==0 if x<1 else x==2) else y+10
+            case IfExp(test, body, orelse) as if_exp:
+                goto_thn = self.create_block(thn, basic_blocks)
+                goto_els = self.create_block(els, basic_blocks)
+                body_ss = self.explicate_pred(body, goto_thn, goto_els, basic_blocks)
+                orelse_ss = self.explicate_pred(
+                    orelse, goto_thn, goto_els, basic_blocks
+                )
+                return self.explicate_pred(test, body_ss, orelse_ss, basic_blocks)
+            # if Begin([res=100], res)
+            case Begin(body, result):
+                result_ss = self.explicate_pred(result, thn, els, basic_blocks)
+                for s in reversed(body):
+                    result_ss = self.explicate_stmt(s, result_ss, basic_blocks)
+                return result_ss
+            case _:
+                return [
+                    If(
+                        Compare(cnd, [Eq()], [Constant(False)]),
+                        self.create_block(els, basic_blocks),
+                        self.create_block(thn, basic_blocks),
+                    )
+                ]
+
+    # generates code for expressions as statments, so their result is ignored and only their side effects matter
+    # 处理 Expr(e) 的 e, 过滤掉纯的表达式
+    # 返回 C_If stmts
+    def explicate_effect(
+        self, e: expr, cont: List[stmt], basic_blocks: Dict[str, List[stmt]]
+    ) -> List[stmt]:
+        match e:
+            case Begin(body, result):
+                begin_block = self.explicate_effect(result, cont, basic_blocks)
+                for s in reversed(body):
+                    begin_block = self.explicate_stmt(s, begin_block, basic_blocks)
+                return begin_block
+            case IfExp(test, body, orelse):
+                assert isinstance(body, Begin)
+                assert isinstance(orelse, Begin)
+                goto_cont = self.create_block(cont, basic_blocks)
+                body_ss = self.explicate_effect(body, goto_cont, basic_blocks)
+                orelse_ss = self.explicate_effect(orelse, goto_cont, basic_blocks)
+                return self.explicate_pred(test, body_ss, orelse_ss, basic_blocks)
+            case Call(func, args):
+                # print(f"======Call(func, args): {func}, {args}")
+                return [Expr(e)] + cont
+            case _:
+                return cont
+
+    # generates code for expressions on the right-hand side of an assignment
+    # 处理 Assign statement
+    # 返回 C_If stmts
+    def explicate_assign(
+        self,
+        rhs: expr,
+        lhs: expr,
+        cont: List[stmt],
+        basic_blocks: Dict[str, List[stmt]],
+    ) -> List[stmt]:
+        match rhs:
+            case IfExp(test, body, orelse):
+                # print(f"======body:{body}")
+                # print(f"======orelse:{orelse}")
+                goto_cont = self.create_block(cont, basic_blocks)
+                body_assign = self.explicate_assign(body, lhs, goto_cont, basic_blocks)
+                orelse_assign = self.explicate_assign(
+                    orelse, lhs, goto_cont, basic_blocks
+                )
+                return self.explicate_pred(
+                    test, body_assign, orelse_assign, basic_blocks
+                )
+
+            case Begin(body, result):
+                result_ss = self.explicate_assign(result, lhs, cont, basic_blocks)
+                for s in reversed(body):
+                    result_ss = self.explicate_stmt(s, result_ss, basic_blocks)
+                return result_ss
+            case _:
+                return [Assign([lhs], rhs)] + cont
+
+    # generates code for statements
+    def explicate_stmt(
+        self, s: stmt, cont: List[stmt], basic_blocks: Dict[str, List[stmt]]
+    ) -> List[stmt]:
+        match s:
+            case Assign([lhs], rhs):
+                return self.explicate_assign(rhs, lhs, cont, basic_blocks)
+            # expression-statement
+            case Expr(value):
+                # print(f"======Expr(value): {value}")
+                return self.explicate_effect(value, cont, basic_blocks)
+            case If(test, body, orelse):
+                goto_cont = self.create_block(cont, basic_blocks)
+                body_ss = goto_cont
+                for s in reversed(body):
+                    self.explicate_stmt(s, body_ss, basic_blocks)
+                orelse_ss = goto_cont
+                for s in reversed(orelse):
+                    self.explicate_stmt(s, orelse_ss, basic_blocks)
+                return self.explicate_pred(test, body_ss, orelse_ss, basic_blocks)
+            case _:
+                raise Exception("explicate_stmt unexpected: " + repr(s))
+
+    # Expr(Call(Name('print'), [Name('tmp.0')]))
+    def explicate_control(self, p: X86Program) -> CProgram:
+        match p:
+            case Module(body):
+                basic_blocks: dict[str, list[stmt]] = {}
+                new_body: list[stmt] = [Return(Constant(0))]
+                # 倒序编译
+                for s in reversed(body):
+                    new_body = self.explicate_stmt(s, new_body, basic_blocks)
+                basic_blocks[label_name("start")] = new_body
+                return CProgram(basic_blocks)
+            case _:
+                raise Exception("explicate_control unexpected: " + repr(p))
+
+    ############################################################################
+    # Select Instructions
+    ############################################################################
+
+    # C_If -> x86_If^Var
+    def select_arg(self, e: expr) -> arg:
+        match e:
+            case Constant(True):
+                return Immediate(1)
+            case Constant(False):
+                return Immediate(0)
+            case _:
+                return super().select_arg(e)
+
+    def select_stmt_assign(self, s: Assign) -> List[instr]:
+        match s:
+            case Assign([Name(var)], UnaryOp(Not(), Name(var2))) if var == var2:
+                return [Instr("xorq", [Immediate(1), Variable(var2)])]
+            case Assign([Name(var)], UnaryOp(Not(), atm)):
+                arg = self.select_arg(atm)
+                return [
+                    Instr("movq", [arg, Variable(var)]),
+                    Instr("xorq", [Immediate(1), Variable(var)]),
+                ]
+            case Assign([Name(var), Compare(left_atm, [cmp], [right_atm])]):
+                left_arg = self.select_arg(left_atm)
+                right_arg = self.select_arg(right_atm)
+                cc = cmpop_to_cc(cmp)
+                return [
+                    Instr("cmpq", [right_arg, left_arg]),
+                    Instr(f"set{cc}", [ByteReg("al")]),
+                    Instr("movzbq", [ByteReg("al"), Variable(var)]),
+                ]
+        return super().select_stmt_assign(s)
+
+    def select_stmt(self, s: stmt) -> List[instr]:
+        match s:
+            case Goto(label):
+                return [Jump(label)]
+            case If(Compare(left_atm, [cmp], [right_atm]), [Goto(thn)], [Goto(els)]):
+                leaft_arg = self.select_arg(left_atm)
+                right_arg = self.select_arg(right_atm)
+                cc = cmpop_to_cc(cmp)
+                return [
+                    Instr("cmpq", [right_arg, leaft_arg]),
+                    JumpIf(cc, thn),
+                    Jump(els),
+                ]
+            # TODO: type error
+            case Return(exp):
+                return [
+                    Instr("movq", [self.select_arg(exp), Reg("rax")]),  # type: ignore
+                    Jump(label_name("conclusion")),
+                ]
+            case _:
+                return super().select_stmt(s)
+
+    def select_instructions(self, p: Module) -> X86Program:
+        new_body = {}
+        for bb, stmts in p.body.items():  # type: ignore
+            instrs = [i for s in stmts for i in self.select_stmt(s)]
+            new_body[bb] = instrs
+        return X86Program(new_body)
+
     ###########################################################################
     # Uncover Live
     ###########################################################################
-
     def read_vars(self, i: instr) -> Set[location]:
         match i:
-            case Instr("movq", [arg1, _]):
-                return arg_to_locations(arg1)
-            case Instr("addq", [arg1, arg2]) | Instr("subq", [arg1, arg2]):
+            case Instr("xorq", [arg1, arg2]):
                 return arg_to_locations(arg1) | arg_to_locations(arg2)
-            case Instr("negq", [arg]):
-                return arg_to_locations(arg)
-            case Instr("pushq", [arg]):
-                return arg_to_locations(arg)
-            case Callq(_, narg):
-                return set([Reg(r) for r in arg_passing_regs[:narg]])
-            case _:
+            case Instr("cmpq", [arg1, arg2]):
+                return arg_to_locations(arg1) | arg_to_locations(arg2)
+            case Instr("movzbq", [arg1, _]):
+                return arg_to_locations(arg1)
+            case Instr(setcc, [_]) if setcc.startswith("set"):
+                return set()  # 不用考虑  EFLAGS
+            case Jump(_) | JumpIf(_, _):
                 return set()
+            case _:
+                return super().read_vars(i)
 
     def write_vars(self, i: instr) -> Set[location]:
         match i:
-            case Instr("movq", [_, arg2]):
+            case Instr("xorq", [_, arg2]):
                 return arg_to_locations(arg2)
-            case Instr("addq", [_, arg2]) | Instr("subq", [_, arg2]):
+            case Instr("cmpq", [_, arg2]):
+                return set()  # 不用考虑 EFLAGS
+            case Instr("movzbq", [_, arg2]):
                 return arg_to_locations(arg2)
-            case Instr("negq", [arg]):
+            case Instr(setcc, [arg]) if setcc.startswith("set"):
                 return arg_to_locations(arg)
-            case Instr("popq", [arg]):
-                return arg_to_locations(arg)
-            case Callq(_, _):
-                return set([Reg(r) for r in caller_saved_regs])
-            case _:
+            case Jump(_) | JumpIf(_, _):
                 return set()
+        return super().write_vars(i)
 
-    """
-    live_after(n) = {}                              # 初始化
-    live_before(k) = (live_after(k) - W(k)) ∪ R(k)  # 迭代
-    live_after(k-1) = live_before(k)                # 传播
-    """
+    def build_cfg(self, basic_blocks: Dict[str, List[instr]]) -> DirectedAdjList:
+        cfg = DirectedAdjList()
 
-    def uncover_live(self, p: X86Program) -> Dict[instr, Set[location]]:
-        live_before = {i: set() for i in range(len(p.body))}
-        live_after = {i: set() for i in range(len(p.body))}
+        for bb, stmts in basic_blocks.items():
+            for i in stmts:
+                match i:
+                    case Jump(label) | JumpIf(_, label):
+                        cfg.add_edge(bb, label)
+                    case _:
+                        pass
+        return cfg
 
-        for i, inst in reversed(list(enumerate(p.body))):
-            live_before[i] = (live_after[i] - self.write_vars(inst)) | self.read_vars(inst)  # type: ignore
+    def uncover_live_inner_bb(
+        self, ss: List[instr], live_before_block: Dict[str, Set[location]]
+    ) -> Dict[instr, Set[location]]:
+        live_before = {i: set() for i in range(len(ss))}
+        live_after = {i: set() for i in range(len(ss))}
+        match ss[len(ss) - 1]:
+            case Jump(label):
+                live_after[len(ss) - 1] = live_before_block[label]
+            case JumpIf(cc, label):
+                live_after[len(ss) - 1] = live_before_block[label]
+            case _:
+                live_after[len(ss) - 1] = set()
+
+        for i, inst in reversed(list(enumerate(ss))):
+            match inst:
+                case Jump(label):
+                    live_before[i] = live_before_block[label]
+                case JumpIf(_, label):
+                    live_before[i] = (
+                        live_after[i] - self.write_vars(inst)
+                    ) | self.read_vars(inst)
+                    live_before[i] = live_before[i].union(live_before_block[label])
+                case _:
+                    live_before[i] = (
+                        live_after[i] - self.write_vars(inst)
+                    ) | self.read_vars(inst)
             if i - 1 >= 0:
                 live_after[i - 1] = live_before[i]
 
-        return {inst: live_after[i] for i, inst in enumerate(p.body)}  # type: ignore
+        return {inst: live_after[i] for i, inst in enumerate(ss)}
+
+    # 基于 cfg 来做 liveness 分析
+    def uncover_live(self, p: X86Program) -> Dict[instr, Set[location]]:
+        assert isinstance(p.body, dict)
+        basic_blocks = p.body
+
+        cfg = self.build_cfg(p.body)
+        rcfg = transpose(cfg)
+        rtopo_order: list[Vertex] = topological_sort(rcfg)  # type: ignore
+        # print(f"======p.body: {p.body}")
+        # print(f"======rtopo_order: {rtopo_order}")
+
+        live_before_block: dict[str, set[location]] = {}
+        live_after = {}
+        for label in rtopo_order:
+            stmts = basic_blocks[label]
+            if label == label_name("conclusion"):
+                live_before_block[label] = set()
+                continue
+
+            live_after_inner_bb = self.uncover_live_inner_bb(stmts, live_before_block)
+            live_before_block[label] = live_after_inner_bb[stmts[0]]
+            live_after.update(live_after_inner_bb)
+
+        return live_after
 
     ############################################################################
     # Build Interference
     ############################################################################
 
-    """
-    ## rule for every instruction
-    If I_k == Instr('movq', [s, d]): 
-      for v in live_after(k):
-        if v != d && v != s:
-          add_edge(d, v)
-    else:
-      for d in W(k):
-        for v in live_after(k):
-          if v!=d:
-            add_edge(d, v)
-
-    ## rule for callq I_k
-    for v in live_after(k):
-      for r in caller_saved_regs:
-        add_edge(v, r)
-    """
-
     def build_interference(
         self, p: X86Program, live_after: Dict[instr, Set[location]]
     ) -> UndirectedAdjList:
+        assert isinstance(p.body, dict)
+
         g = UndirectedAdjList()
-        for inst in p.body:
-            match inst:
-                case Instr("movq", [s, d]) if islocation(d):
-                    for v in live_after[inst]:
-                        if v != d and v != s:
-                            g.add_edge(d, v)
-                # For the callq instruction, we consider all the caller-saved registers to have been written to
-                case Callq(_, _):
-                    for v in live_after[inst]:
-                        for r in caller_saved_regs:
-                            g.add_edge(v, Reg(r))
-                case _:
-                    for d in self.write_vars(inst):  # type: ignore
-                        for v in live_after[inst]:  # type: ignore
-                            if v != d:
+        for _, instrs in p.body.items():
+            for inst in instrs:
+                match inst:
+                    case Instr("movq", [s, d]) | Instr("movzbq", [s, d]) if islocation(
+                        d
+                    ):
+                        for v in live_after[inst]:
+                            if v != d and v != s:
                                 g.add_edge(d, v)
-            # match inst:
-            #     case Callq(_, _):
-            #         for v in live_after[inst]:
-            #             for r in caller_saved_regs:
-            #                 g.add_edge(v, Reg(r))
-            #     case _:
-            #         pass
+                    case Callq(_, _):
+                        for v in live_after[inst]:
+                            for r in caller_saved_regs:
+                                g.add_edge(v, Reg(r))
+                    case _:
+                        for d in self.write_vars(inst):  # type: ignore
+                            for v in live_after[inst]:  # type: ignore
+                                if v != d:
+                                    g.add_edge(d, v)
 
         return g
-
-    ############################################################################
-    # Allocate Registers
-    ############################################################################
-
-    # Returns the coloring and the set of spilled variables.
-    def color_graph(
-        self, graph: UndirectedAdjList, variables: Set[location]
-    ) -> Tuple[Dict[location, int], Set[location]]:
-        def mex(s: Set[int]) -> int:  # type: ignore
-            i = 0
-            while i in s:  # type: ignore
-                i += 1
-            return i
-
-        vertices: list[location] = list(graph.vertices())
-        # print(vertices)
-        saturation: dict[location, set[int]] = {v: set() for v in vertices}
-        color: dict[location, int] = {}
-        for v in vertices:
-            match v:
-                case Reg(r):
-                    color[v] = reg_to_id(r)
-                    for vv in set(graph.adjacent(v)):
-                        saturation[vv] = {reg_to_id(r)}
-                case _:
-                    continue
-        # print(color)
-        # print(saturation)
-
-        # isinstance(x, KeyWithPosition)
-        worklist = PriorityQueue(
-            lambda x, y: len(saturation[x.key]) < len(saturation[y.key])
-        )
-        for v in vertices:
-            # 这里不要过滤 Reg, 否则 worklist.increase_key(v) 会 KeyError
-            worklist.push(v)
-
-        while not worklist.empty():
-            u = worklist.pop()
-            if u in color:
-                continue
-            c = mex(saturation[u])
-            color[u] = c
-            # propagate
-            for v in graph.adjacent(u):
-                saturation[v].add(c)
-                worklist.increase_key(v)
-
-        # coloring 只包含 Variable
-        coloring = {}
-        spilled = set()
-        for loc, col in color.items():
-            match loc:
-                case Variable(v):
-                    assert col >= 0
-                    if col > max(id_to_regs.keys()):
-                        spilled.add(loc)
-                    else:
-                        coloring[loc] = col
-                case Reg(_):
-                    continue
-                    # coloring[loc] = col
-
-        return coloring, spilled
-
-    # NOTE: 修改了返回值类型, X86Program 改为 Tuple[Dict[location, arg], Dict[Variable, arg]]
-    def allocate_registers(
-        self, p: X86Program, g: UndirectedAdjList
-    ) -> Tuple[Dict[location, arg], Dict[Variable, arg]]:
-        coloring, spilled = self.color_graph(
-            g, set(filter(lambda x: isinstance(x, Variable), g.vertices()))
-        )
-
-        # pushq rbp: rbp 不参与寄存器分配
-        self.used_callee: list[str] = []
-
-        coloring_home: dict[location, arg] = {
-            var: Reg(id_to_reg(reg_id)) for var, reg_id in coloring.items()
-        }
-
-        for _, a in coloring_home.items():
-            match a:
-                case Reg(r):
-                    if r in callee_saved_regs:
-                        self.used_callee.append(r)
-                case _:
-                    pass
-        self.used_callee = list(set(self.used_callee))  # 去重
-        assert "rbp" not in self.used_callee
-
-        spilled_home: dict[Variable, arg] = {}
-        for i, var in enumerate(spilled):
-            match var:
-                case Variable(v):
-                    spilled_home[var] = Deref("rbp", -8 * (i + 1))
-                case _:
-                    raise Exception("allocate_registers: spilled should be Variable")
-        return coloring_home, spilled_home  # type: ignore
 
     ############################################################################
     # Assign Homes
     ############################################################################
 
+    # x86_Var -> x86_If
+
     def assign_homes(self, pseudo_x86: X86Program) -> X86Program:
+        assert isinstance(pseudo_x86.body, dict)
+
+        # 手动补充一个 conclusion block
+        pseudo_x86.body[label_name("conclusion")] = []
+
         live_after = self.uncover_live(pseudo_x86)
         g = self.build_interference(pseudo_x86, live_after)
         coloring_home, spilled_home = self.allocate_registers(pseudo_x86, g)
         home = {**coloring_home, **spilled_home}
         self.spilled_size = len(spilled_home) * 8
-        return X86Program([self.assign_homes_instr(i, home) for i in pseudo_x86.body])  # type: ignore
+
+        new_body: dict[str, list[instr]]= {}
+        for bb, instrs in pseudo_x86.body.items():
+            new_body[bb] = [self.assign_homes_instr(i, home) for i in instrs] # type: ignore
+
+        return X86Program(new_body)
 
     ###########################################################################
     # Patch Instructions
     ###########################################################################
 
-    def patch_instructions(self, p: X86Program) -> X86Program:
-        filtered_instrs = []
-        for inst in p.body:
-            match inst:
-                case Instr("movq", [Deref(_, _) as d1, Deref(_, _) as d2]) if d1 == d2:
-                    continue
-                case Instr("movq", [Reg(r1), Reg(r2)]) if r1 == r2:
-                    continue
-                case _:
-                    filtered_instrs.append(inst)
-        return super().patch_instructions(X86Program(filtered_instrs))
+    def patch_instr(self, i: instr) -> List[instr]:
+        match i:
+            case Instr("cmpq", [arg, Immediate(n)]):
+                return [
+                    Instr("movq", [Immediate(n), Reg("rax")]),
+                    Instr("cmpq", [arg, Reg("rax")])
+                ]
+            case Instr("movbzq", [arg, Deref(reg, off)]):
+                return [
+                    Instr("movbzq", [arg, Reg("rax")]),
+                    Instr("movq", [Reg("rax"), Deref(reg, off)])
+                ]
+            case Jump(_):
+                return [i]
+            case _:
+                return super().patch_instr(i)
 
+    def patch_instructions(self, p: X86Program) -> X86Program:
+        assert isinstance(p.body, dict)
+
+        new_body = {}
+        for bb, instrs in p.body.items():
+            new_body[bb] = [ii for i in instrs for ii in self.patch_instr(i)]
+
+        return X86Program(new_body)
+    
     ###########################################################################
     # Prelude & Conclusion
     ###########################################################################
@@ -323,185 +543,26 @@ class Compiler(compiler.Compiler):
     def prelude_and_conclusion(self, p: X86Program) -> X86Program:
         # print(self.spilled_size)
         # print(self.used_callee)
+        assert isinstance(p.body, dict)
         used_callee_size = len(self.used_callee) * 8
         rsp_aligned = align(self.spilled_size + used_callee_size, 16) - used_callee_size
 
-        new_body = (
-            [
-                Instr("pushq", [Reg("rbp")]),
-                Instr("movq", [Reg("rsp"), Reg("rbp")]),
-            ]
-            + [Instr("pushq", [Reg(r)]) for r in self.used_callee]
-        )
+        prelude = [
+            Instr("pushq", [Reg("rbp")]),
+            Instr("movq", [Reg("rsp"), Reg("rbp")]),
+        ]
+        prelude += [Instr("pushq", [Reg(r)]) for r in self.used_callee]
         if rsp_aligned > 0:
-            new_body += [Instr("subq", [Immediate(rsp_aligned), Reg("rsp")])]
-        new_body += p.body  # type: ignore
+            prelude += [Instr("subq", [Immediate(rsp_aligned), Reg("rsp")])]
+        p.body[label_name('main')] = prelude + [Jump(label_name("start"))]
+
+        conclusion = [
+            Instr("popq", [Reg(r)]) for r in reversed(self.used_callee)] + [
+            Instr("popq", [Reg("rbp")]),
+            Instr("retq", []),
+        ]
         if rsp_aligned > 0:
-            new_body += [Instr("addq", [Immediate(rsp_aligned), Reg("rsp")])]
-        new_body += (
-            [Instr("popq", [Reg(r)]) for r in reversed(self.used_callee)]
-            + [
-                Instr("popq", [Reg("rbp")]),
-                Instr("retq", []),
-            ]
-        )
-        return X86Program(new_body)  # type: ignore
+            conclusion.insert(0, Instr("addq", [Immediate(rsp_aligned), Reg("rsp")]))
+        p.body[label_name('conclusion')] = conclusion
 
-
-def test_uncover_live_1():
-    live_after = {}
-    i1 = Instr("movq", [Immediate(1), Variable("v")])
-    live_after[i1] = {Variable("v")}
-
-    i2 = Instr("movq", [Immediate(42), Variable("w")])
-    live_after[i2] = {Variable("w"), Variable("v")}
-
-    i3 = Instr("movq", [Variable("v"), Variable("x")])
-    live_after[i3] = {Variable("w"), Variable("x")}
-
-    i4 = Instr("addq", [Immediate(7), Variable("x")])
-    live_after[i4] = {Variable("w"), Variable("x")}
-
-    i5 = Instr("movq", [Variable("x"), Variable("y")])
-    live_after[i5] = {Variable("w"), Variable("x"), Variable("y")}
-
-    i6 = Instr("movq", [Variable("x"), Variable("z")])
-    live_after[i6] = {Variable("w"), Variable("y"), Variable("z")}
-
-    i7 = Instr("addq", [Variable("w"), Variable("z")])
-    live_after[i7] = {Variable("y"), Variable("z")}
-
-    i8 = Instr("movq", [Variable("y"), Variable("tmp_0")])
-    live_after[i8] = {Variable("tmp_0"), Variable("z")}
-
-    i9 = Instr("negq", [Variable("tmp_0")])
-    live_after[i9] = {Variable("tmp_0"), Variable("z")}
-
-    i10 = Instr("movq", [Variable("z"), Variable("tmp_1")])
-    live_after[i10] = {Variable("tmp_0"), Variable("tmp_1")}
-
-    i11 = Instr("addq", [Variable("tmp_0"), Variable("tmp_1")])
-    live_after[i11] = {Variable("tmp_1")}
-
-    i12 = Instr("movq", [Variable("tmp_1"), Reg("rdi")])
-    live_after[i12] = {Reg("rdi")}
-
-    i13 = Callq("print_int", 1)
-    live_after[i13] = set()
-
-    p = X86Program([i1, i2, i3, i4, i5, i6, i7, i8, i9, i10, i11, i12, i13])
-    c = Compiler()
-    assert live_after == c.uncover_live(p)
-
-
-# sub-int, select_instructions
-def test_uncover_live_2():
-    live_after = {}
-    i1 = Callq("read_int", 0)
-    i2 = Instr("movq", [Reg("rax"), Variable("tmp.0")])
-    i3 = Callq("read_int", 0)
-    i4 = Instr("movq", [Reg("rax"), Variable("tmp.1")])
-    i5 = Instr("movq", [Variable("tmp.0"), Variable("tmp.2")])
-    i6 = Instr("subq", [Variable("tmp.1"), Variable("tmp.2")])
-    live_after[i6] = {Variable("tmp.1"), Variable("tmp.2")}
-    i7 = Instr("movq", [Variable("tmp.2"), Reg("rdi")])
-    live_after[i7] = {Reg("rdi")}
-    i8 = Callq("print_int", 1)
-    live_after[i8] = {}
-
-    p = X86Program([i1, i2, i3, i4, i5, i6, i7, i8])
-    c = Compiler()
-    # print(c.uncover_live(p))
-
-
-def helper_generate_program():
-    i1 = Instr("movq", [Immediate(1), Variable("v")])
-    i2 = Instr("movq", [Immediate(42), Variable("w")])
-    i3 = Instr("movq", [Variable("v"), Variable("x")])
-    i4 = Instr("addq", [Immediate(7), Variable("x")])
-    i5 = Instr("movq", [Variable("x"), Variable("y")])
-    i6 = Instr("movq", [Variable("x"), Variable("z")])
-    i7 = Instr("addq", [Variable("w"), Variable("z")])
-    i8 = Instr("movq", [Variable("y"), Variable("tmp_0")])
-    i9 = Instr("negq", [Variable("tmp_0")])
-    i10 = Instr("movq", [Variable("z"), Variable("tmp_1")])
-    i11 = Instr("addq", [Variable("tmp_0"), Variable("tmp_1")])
-    i12 = Instr("movq", [Variable("tmp_1"), Reg("rdi")])
-    i13 = Callq("print_int", 1)
-    return X86Program([i1, i2, i3, i4, i5, i6, i7, i8, i9, i10, i11, i12, i13])
-
-
-def test_build_interference_1():
-    i1 = Instr("movq", [Immediate(1), Variable("v")])
-    i2 = Instr("movq", [Immediate(42), Variable("w")])
-    i3 = Instr("movq", [Variable("v"), Variable("x")])
-    i4 = Instr("addq", [Immediate(7), Variable("x")])
-    i5 = Instr("movq", [Variable("x"), Variable("y")])
-    i6 = Instr("movq", [Variable("x"), Variable("z")])
-    i7 = Instr("addq", [Variable("w"), Variable("z")])
-    i8 = Instr("movq", [Variable("y"), Variable("tmp_0")])
-    i9 = Instr("negq", [Variable("tmp_0")])
-    i10 = Instr("movq", [Variable("z"), Variable("tmp_1")])
-    i11 = Instr("addq", [Variable("tmp_0"), Variable("tmp_1")])
-    i12 = Instr("movq", [Variable("tmp_1"), Reg("rdi")])
-    i13 = Callq("print_int", 1)
-
-    p = X86Program([i1, i2, i3, i4, i5, i6, i7, i8, i9, i10, i11, i12, i13])
-    c = Compiler()
-    live_after = c.uncover_live(p)
-
-    assert c.build_interference(X86Program([i1]), live_after).edges() == set()
-    assert c.build_interference(X86Program([i2]), live_after).edges() == {
-        UEdge(Variable("w"), Variable("v"))
-    }
-    assert c.build_interference(X86Program([i3]), live_after).edges() == {
-        UEdge(Variable("x"), Variable("w"))
-    }
-    assert c.build_interference(X86Program([i4]), live_after).edges() == {
-        UEdge(Variable("x"), Variable("w"))
-    }
-    assert c.build_interference(X86Program([i5]), live_after).edges() == {
-        UEdge(Variable("y"), Variable("w"))
-    }
-    assert c.build_interference(X86Program([i6]), live_after).edges() == {
-        UEdge(Variable("z"), Variable("w")),
-        UEdge(Variable("z"), Variable("y")),
-    }
-    assert c.build_interference(X86Program([i7]), live_after).edges() == {
-        UEdge(Variable("z"), Variable("y"))
-    }
-    assert c.build_interference(X86Program([i8]), live_after).edges() == {
-        UEdge(Variable("tmp_0"), Variable("z"))
-    }
-    assert c.build_interference(X86Program([i9]), live_after).edges() == {
-        UEdge(Variable("tmp_0"), Variable("z"))
-    }
-    assert c.build_interference(X86Program([i10]), live_after).edges() == {
-        UEdge(Variable("tmp_0"), Variable("tmp_1"))
-    }
-    assert c.build_interference(X86Program([i11]), live_after).edges() == set()
-    assert c.build_interference(X86Program([i12]), live_after).edges() == set()
-    assert c.build_interference(X86Program([i13]), live_after).edges() == set()
-
-
-def test_assign_homes_1():
-    pseudo_x86 = helper_generate_program()
-    c = Compiler()
-    p = c.assign_homes(pseudo_x86)
-    # print(p)
-
-
-def test_preclude_and_conclusion_1():
-    pseudo_x86 = helper_generate_program()
-    c = Compiler()
-    p = c.assign_homes(pseudo_x86)
-    p = c.prelude_and_conclusion(p)
-    # print(p)
-
-
-if __name__ == "__main__":
-    test_uncover_live_1()
-    test_uncover_live_2()
-    test_build_interference_1()
-    test_assign_homes_1()
-    test_preclude_and_conclusion_1()
+        return X86Program(p.body)  # type: ignore
