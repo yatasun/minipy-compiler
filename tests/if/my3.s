@@ -1,27 +1,27 @@
 	.align 16
-_block.18:
+_block.22:
     movq %rbx, %rdi
     callq _print_int
     movq $0, %rax
     jmp _conclusion
 
 	.align 16
-_block.19:
+_block.23:
     movq $42, %rbx
-    jmp _block.18
+    jmp _block.22
 
 	.align 16
-_block.20:
+_block.24:
     movq $0, %rbx
-    jmp _block.18
+    jmp _block.22
 
 	.align 16
 _start:
     callq _read_int
     movq %rax, %rbx
     cmpq $1, %rbx
-    je _block.19
-    jmp _block.20
+    je _block.23
+    jmp _block.24
 
 	.align 16
 _conclusion:

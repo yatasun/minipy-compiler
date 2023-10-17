@@ -24,7 +24,7 @@ def cmpop_to_cc(cmp: cmpop) -> str:
         case LtE():
             return "le"
         case Gt():
-            return "ne"
+            return "g"
         case GtE():
             return "ge"
         case _:
@@ -312,7 +312,7 @@ class Compiler(compiler_register_allocator.Compiler):
                     Instr("movq", [arg, Variable(var)]),
                     Instr("xorq", [Immediate(1), Variable(var)]),
                 ]
-            case Assign([Name(var), Compare(left_atm, [cmp], [right_atm])]):
+            case Assign([Name(var)], Compare(left_atm, [cmp], [right_atm])):
                 left_arg = self.select_arg(left_atm)
                 right_arg = self.select_arg(right_atm)
                 cc = cmpop_to_cc(cmp)
@@ -321,7 +321,8 @@ class Compiler(compiler_register_allocator.Compiler):
                     Instr(f"set{cc}", [ByteReg("al")]),
                     Instr("movzbq", [ByteReg("al"), Variable(var)]),
                 ]
-        return super().select_stmt_assign(s)
+            case _:
+                return super().select_stmt_assign(s)
 
     def select_stmt(self, s: stmt) -> List[instr]:
         match s:

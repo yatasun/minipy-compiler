@@ -202,6 +202,18 @@ class Compiler(compiler.Compiler):
         color: dict[location, int] = {}
         for v in vertices:
             match v:
+                case ByteReg(r):
+                    def byte_reg_to_reg(r: str) -> str:
+                        if r.startswith("a"):
+                            return "rax"
+                        if r.startswith("b"):
+                            return "rbx"
+                        if r.startswith("c"):
+                            return "rcx"
+                        if r.startswith("d"):
+                            return "rdx"
+                        raise Exception(f"byte_reg_to_reg: invalid byte reg: {r}")
+                    color[v] = reg_to_id(byte_reg_to_reg(r))
                 case Reg(r):
                     color[v] = reg_to_id(r)
                     for vv in set(graph.adjacent(v)):
