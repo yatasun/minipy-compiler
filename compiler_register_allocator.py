@@ -26,6 +26,7 @@ id_to_regs = {
     # 8: "r12",
     # 9: "r13",
     # 10: "r14",
+
     0: "rbx",
     1: "r12",
     2: "r13",
@@ -81,6 +82,9 @@ def arg_to_locations(a: arg) -> Set[location]:
     match a:
         case Variable(_) | Reg(_) | ByteReg(_):
             return {a}
+        # FIXME: Deref 似乎不算 location, 但是 build_interference 需要用
+        # case Deref(r, _):
+        #     return {Reg(r)}
         case _:
             return set()
 
@@ -214,10 +218,12 @@ class Compiler(compiler.Compiler):
                             return "rdx"
                         raise Exception(f"byte_reg_to_reg: invalid byte reg: {r}")
                     color[v] = reg_to_id(byte_reg_to_reg(r))
+                    for vv in set(graph.adjacent(v)):
+                        saturation[vv] = {color[v]}
                 case Reg(r):
                     color[v] = reg_to_id(r)
                     for vv in set(graph.adjacent(v)):
-                        saturation[vv] = {reg_to_id(r)}
+                        saturation[vv] = {color[v]}
                 case _:
                     continue
         # print(color)
@@ -279,8 +285,6 @@ class Compiler(compiler.Compiler):
                 case Reg(r):
                     if r in callee_saved_regs:
                         self.used_callee.append(r)
-                case _:
-                    pass
         self.used_callee = list(set(self.used_callee))  # 去重
         assert "rbp" not in self.used_callee
 
@@ -291,6 +295,8 @@ class Compiler(compiler.Compiler):
                     spilled_home[var] = Deref("rbp", -8 * (i + 1))
                 case _:
                     raise Exception("allocate_registers: spilled should be Variable")
+        self.spilled_size = len(spilled_home) * 8
+
         return coloring_home, spilled_home  # type: ignore
 
     ############################################################################
@@ -302,7 +308,6 @@ class Compiler(compiler.Compiler):
         g = self.build_interference(pseudo_x86, live_after)
         coloring_home, spilled_home = self.allocate_registers(pseudo_x86, g)
         home = {**coloring_home, **spilled_home}
-        self.spilled_size = len(spilled_home) * 8
         return X86Program([self.assign_homes_instr(i, home) for i in pseudo_x86.body])  # type: ignore
 
     ###########################################################################
@@ -316,6 +321,7 @@ class Compiler(compiler.Compiler):
                 case Instr("movq", [Deref(_, _) as d1, Deref(_, _) as d2]) if d1 == d2:
                     continue
                 case Instr("movq", [Reg(r1), Reg(r2)]) if r1 == r2:
+                    # print(f"---->>>>>filter: {inst}")
                     continue
                 case _:
                     filtered_instrs.append(inst)
