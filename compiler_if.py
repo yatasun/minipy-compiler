@@ -27,6 +27,9 @@ def cmpop_to_cc(cmp: cmpop) -> str:
             return "g"
         case GtE():
             return "ge"
+        # L_Tup
+        case Is(): 
+            return "e"
         case _:
             raise Exception("cmpop_to_cc unexpected: " + repr(cmp))
 
@@ -157,7 +160,7 @@ class Compiler(compiler_register_allocator.Compiler):
     # generates code for an if expression or statement by analyzing the condition expression
     # 返回 `stmt` ... If(Compare(atm, [cmp], [atm]), [Goto(label)], [Goto(label)])
     def explicate_pred(
-        self, cnd, thn, els, basic_blocks: Dict[str, List[stmt]]
+        self, cnd: expr, thn: List[stmt], els: List[stmt], basic_blocks: Dict[str, List[stmt]]
     ) -> List[stmt]:
         match cnd:
             case Compare(left, [op], [right]):
@@ -202,7 +205,7 @@ class Compiler(compiler_register_allocator.Compiler):
     ) -> List[stmt]:
         match e:
             case Begin(body, result):
-                begin_block = self.explicate_effect(result, cont, basic_blocks)
+                begin_block = self.explicate_effect(result, cont, basic_blocks) + cont
                 for s in reversed(body):
                     begin_block = self.explicate_stmt(s, begin_block, basic_blocks)
                 return begin_block
@@ -515,6 +518,7 @@ class Compiler(compiler_register_allocator.Compiler):
     ###########################################################################
 
     def patch_instr(self, i: instr) -> List[instr]:
+        # print(f"======>>>>>>>patch_instr: {i}")
         match i:
             case Instr("cmpq", [arg, Immediate(n)]):
                 return [
