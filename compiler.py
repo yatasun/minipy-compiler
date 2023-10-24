@@ -2,6 +2,7 @@ import ast
 from ast import *
 from utils import *
 from x86_ast import *
+import x86_ast
 import os
 from typing import List, Tuple, Set, Dict
 from functools import reduce
@@ -17,9 +18,9 @@ class Compiler:
 
     # L_Var -> L_Var^mon
 
-    def is_atomic(self, e: expr) -> bool:
+    def isatomic(self, e: expr) -> bool:
         match e:
-            case Constant(_) | Name(_):
+            case Constant(_) | Name(_) | GlobalValue(_):
                 return True
             case _:
                 return False
@@ -41,12 +42,14 @@ class Compiler:
                 result_expr, result_temps = UnaryOp(op, new_exp), temps
 
             case BinOp(exp1, op, exp2):
+                # print(f"------>>>>>{e}, need_atomic: {need_atomic}")
                 (new_exp1, temps1) = self.rco_exp(exp1, True)
                 (new_exp2, temps2) = self.rco_exp(exp2, True)
                 result_expr, result_temps = (
                     BinOp(new_exp1, op, new_exp2),
                     temps1 + temps2,
                 )
+                # print(f"------<<<<<{result_expr}, {result_temps}")
 
             case _:
                 raise Exception("rco_exp unexpected: " + repr(e))
@@ -182,11 +185,15 @@ class Compiler:
                 if var in home:
                     return home[var]
                 else:
+                    # raise Exception("unreachable")
+                    # print(f"====old spilled_size: {self.spilled_size}", )
                     self.spilled_size += 8
                     home[var] = Deref("rbp", -self.spilled_size)
+                    print(f"assign_homes_arg: ({var}) => ({home[var]})")
                     return home[var]
             case _:
-                raise Exception("assign_homes_arg unexpected " + repr(a))
+                return a
+                # raise Exception("assign_homes_arg unexpected " + repr(a))
 
     def assign_homes_instr(self, i: instr, home: Dict[Variable, arg]) -> instr:
         match i:
@@ -216,6 +223,7 @@ class Compiler:
     ############################################################################
 
     def patch_instr(self, i: instr) -> List[instr]:
+        # print(f"**********patch_instr: {i}")
         match i:
             case Instr(op, [Immediate(n) as imm]) if n > 2**16:
                 return [Instr("movq", [imm, Reg("rax")]), Instr(op, [Reg("rax")])]
@@ -227,6 +235,12 @@ class Compiler:
                         return [
                             Instr("movq", [deref1, Reg("rax")]),
                             Instr(op, [Reg("rax"), deref2]),
+                        ]
+                    # TODO: Global 类似于 Deref?
+                    case (Deref(_, _) | x86_ast.Global(_), Deref(_, _) | x86_ast.Global(_)):
+                        return [
+                            Instr("movq", [arg1, Reg("rax")]),
+                            Instr(op, [Reg("rax"), arg2])
                         ]
                     case (Immediate(n) as imm, _) if n > 2**16:
                         return [
