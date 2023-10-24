@@ -77,7 +77,7 @@ class Compiler(compiler_while.Compiler):
             case BoolOp(op, [exp1, exp2]):
                 return BoolOp(op, [self.expose_exp(exp1), self.expose_exp(exp2)])
             case Compare(exp1, [cmp], [exp2]):
-                return Compare(self.expose_exp(exp1), [cmp], self.expose_exp(exp2))
+                return Compare(self.expose_exp(exp1), [cmp], [self.expose_exp(exp2)])
             case IfExp(exp1, exp2, exp3):
                 return IfExp(
                     self.expose_exp(exp1), self.expose_exp(exp2), self.expose_exp(exp3)

@@ -59,15 +59,15 @@ interp_dict = {
 }
 
 if True:
-    # run_tests('var', compiler, 'var',
-    #           typecheck_dict,
-    #           interp_dict)
-    # run_tests('if', compiler, 'if',
-    #           typecheck_dict,
-    #           interp_dict)
-    # run_tests('while', compiler, 'while',
-    #           typecheck_dict,
-    #           interp_dict)
+    run_tests('var', compiler, 'var',
+              typecheck_dict,
+              interp_dict)
+    run_tests('if', compiler, 'if',
+              typecheck_dict,
+              interp_dict)
+    run_tests('while', compiler, 'while',
+              typecheck_dict,
+              interp_dict)
     run_tests('tup', compiler, 'tup',
               typecheck_dict,
               interp_dict)
