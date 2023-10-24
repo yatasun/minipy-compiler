@@ -32,6 +32,26 @@ class X86Emulator:
 
         self.global_vals = {}
 
+        # 初始化, 方便测试
+        rootstack_size = 2**16
+        heap_size = 2**16
+
+        rs_begin = 2000
+        rs_end = rs_begin + rootstack_size
+
+        fromspace_begin = 100000
+        fromspace_end = fromspace_begin + heap_size 
+
+        self.global_vals = {
+            label_name('rootstack_begin'): rs_begin,
+            label_name('rootstack_end'): rs_end,
+            label_name('free_ptr'): fromspace_begin,
+            label_name('fromspace_begin'): fromspace_begin,
+            label_name('fromspace_end'): fromspace_end
+        }
+
+        self.registers["r15"] = self.global_vals[label_name("rootstack_begin")]
+
     def log(self, s):
         if self.logging:
             print(s)
@@ -342,6 +362,13 @@ class X86Emulator:
                         'free_ptr': fromspace_begin,
                         'fromspace_begin': fromspace_begin,
                         'fromspace_end': fromspace_end
+                    }
+                    self.global_vals = { **self.global_vals,
+                        label_name('rootstack_begin'): rs_begin,
+                        label_name('rootstack_end'): rs_end,
+                        label_name('free_ptr'): fromspace_begin,
+                        label_name('fromspace_begin'): fromspace_begin,
+                        label_name('fromspace_end'): fromspace_end
                     }
 
                     if self.logging:
