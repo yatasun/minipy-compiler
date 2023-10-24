@@ -5,6 +5,7 @@ from utils import trace
 
 def analyze_dataflow(G, transfer, bottom, join):
     trans_G = transpose(G)
+    # mapping 是 live_before_block
     mapping = {}
     for v in G.vertices():
         mapping[v] = bottom

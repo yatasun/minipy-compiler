@@ -29,6 +29,8 @@ def convert_arg(arg):
             return Tree('reg_a', [id])
         case GlobalValue(id):
             return Tree('global_val_a', [id, 'rip'])
+        case Global(id):
+            return Tree('global_val_a', [id, 'rip'])
         case _:
             raise Exception('convert_arg: unhandled ' + repr(arg))
 

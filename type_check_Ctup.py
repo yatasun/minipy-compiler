@@ -54,6 +54,8 @@ class TypeCheckCtup(TypeCheckCwhile):
               return Bottom()
             case _:
               raise Exception('error, expected a tuple, not ' + repr(tup_t))
+        case GlobalValue(_):
+          return IntType()
         case _:
           return super().type_check_exp(e, env)
 
