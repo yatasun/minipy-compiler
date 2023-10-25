@@ -540,7 +540,16 @@ class Compiler(compiler_register_allocator.Compiler):
 
         new_body = {}
         for bb, instrs in p.body.items():
-            new_body[bb] = [ii for i in instrs for ii in self.patch_instr(i)]
+            filtered_instrs = []
+            for inst in instrs:
+                match inst:
+                    case Instr("movq", [Deref(_, _) as d1, Deref(_, _) as d2]) if d1 == d2:
+                        continue
+                    case Instr("movq", [Reg(r1), Reg(r2)]) if r1 == r2:
+                        continue
+                    case _:
+                        filtered_instrs.append(inst)
+            new_body[bb] = [ii for i in filtered_instrs for ii in self.patch_instr(i)]
 
         return X86Program(new_body)
     
