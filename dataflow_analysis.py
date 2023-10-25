@@ -1,7 +1,9 @@
 from collections import deque
-from graph import transpose
+from typing import Dict, List
+from graph import DirectedAdjList, transpose
 from functools import reduce
 from utils import trace
+from x86_ast import Jump, JumpIf, instr
 
 def analyze_dataflow(G, transfer, bottom, join):
     trans_G = transpose(G)
@@ -21,3 +23,13 @@ def analyze_dataflow(G, transfer, bottom, join):
             for v in G.adjacent(node):
                 worklist.append(v)
 
+
+def build_cfg(basic_blocks: Dict[str, List[instr]]) -> DirectedAdjList:
+    cfg = DirectedAdjList()
+
+    for bb, stmts in basic_blocks.items():
+        for i in stmts:
+            match i:
+                case Jump(label) | JumpIf(_, label):
+                    cfg.add_edge(bb, label)
+    return cfg

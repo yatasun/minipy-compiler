@@ -9,6 +9,7 @@ import compiler
 import compiler_if
 import compiler_while
 import compiler_tup
+import compiler_fun
 import interp_Lvar
 import interp_Lif
 import interp_Cif
@@ -28,6 +29,7 @@ compiler = compiler.Compiler()
 compiler = compiler_if.Compiler()
 compiler = compiler_while.Compiler()
 compiler = compiler_tup.Compiler()
+compiler = compiler_fun.Compiler()
 
 typecheck_Lvar = type_check_Lvar.TypeCheckLvar().type_check
 typecheck_Lif = type_check_Lif.TypeCheckLif().type_check
