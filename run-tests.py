@@ -1,9 +1,8 @@
 import os
 import sys
 
-# 没有 __init__.py, 所以用这种机制吗 ?
-sys.path.append('../iucompiler')
-sys.path.append('../iucompiler/interp_x86')
+sys.path.append('../minipy-compiler')
+sys.path.append('../minipy-compiler/interp_x86')
 
 import compiler
 import compiler_if
