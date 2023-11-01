@@ -44,17 +44,31 @@ def convert_instr(instr):
             return Tree('jmp', [label])
         case JumpIf(cc, label):
             return Tree('j' + cc, [label])
+        case IndirectCallq(func, args):
+            return Tree('indirect_callq', [convert_arg(func)])
+        case TailJump(func, arg):
+            return Tree('indirect_jmp', [convert_arg(func)])
         case _:
             raise Exception('error in convert_instr, unhandled ' + repr(instr))
 
 def convert_program(p):
-    if isinstance(p.body, list):
-        main_instrs = [convert_instr(instr) for instr in p.body]
-        main_block = Tree('block', [label_name('main')] + main_instrs)
-        return Tree('prog', [main_block])
-    elif isinstance(p.body, dict):
-        blocks = []
-        for (l, ss) in p.body.items():
-            blocks.append(Tree('block',
-                               [l] + [convert_instr(instr) for instr in ss]))
-        return Tree('prog', blocks)
+    match p:
+        case X86Program(_):
+            if isinstance(p.body, list):
+                main_instrs = [convert_instr(instr) for instr in p.body]
+                main_block = Tree('block', [label_name('main')] + main_instrs)
+                return Tree('prog', [main_block])
+            elif isinstance(p.body, dict):
+                blocks = []
+                for (l, ss) in p.body.items():
+                    blocks.append(Tree('block',
+                                       [l] + [convert_instr(instr) for instr in ss]))
+                return Tree('prog', blocks)
+        case X86ProgramDefs(_):
+            blocks = []
+            for d in p.defs:
+                for (l, ss) in d.body.items():
+                    blocks.append(Tree('block',
+                                       [l] + [convert_instr(instr) for instr in ss]))
+            return Tree('prog', blocks)
+
