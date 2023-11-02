@@ -191,9 +191,9 @@ class Compiler(compiler_register_allocator.Compiler):
             case _:
                 return [
                     If(
-                        Compare(cnd, [Eq()], [Constant(False)]),
-                        self.create_block(els, basic_blocks),
+                        Compare(cnd, [Eq()], [Constant(True)]),
                         self.create_block(thn, basic_blocks),
+                        self.create_block(els, basic_blocks),
                     )
                 ]
 
