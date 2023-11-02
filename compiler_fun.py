@@ -1,15 +1,16 @@
 from ast import Assign, Dict, List, Module, Set, arg, expr, stmt, cmpop, Tuple
+
 from dataflow_analysis import analyze_dataflow, build_cfg
 from graph import (
     UndirectedAdjList,
     transpose,
 )
 from priority_queue import PriorityQueue
-from type_check_Ctup import TypeCheckCtup
-from type_check_Ltup import TypeCheckLtup
-from utils import Assign, Dict, List, Module, Set, arg, expr, stmt
+from type_check_Lfun import TypeCheckLfun
+from type_check_Cfun import TypeCheckCfun
+from utils import Assign, Dict, List, Module, Set, arg, expr, stmt, IntType
 from utils import *
-from typing import List, Tuple, Set, Dict
+from typing import List, Optional, Tuple, Set, Dict
 
 from x86_ast import *
 import x86_ast
@@ -17,6 +18,7 @@ from x86_ast import X86Program, arg, instr, location, Global
 
 Binding = Tuple[Name, expr]
 Temporaries = List[Binding]
+
 
 def cmpop_to_cc(cmp: cmpop) -> str:
     match cmp:
@@ -33,10 +35,11 @@ def cmpop_to_cc(cmp: cmpop) -> str:
         case GtE():
             return "ge"
         # L_Tup
-        case Is(): 
+        case Is():
             return "e"
         case _:
             raise Exception("cmpop_to_cc unexpected: " + repr(cmp))
+
 
 caller_saved_regs = ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"]
 callee_saved_regs = ["rsp", "rbp", "rbx", "r12", "r13", "r14", "r15"]
@@ -55,7 +58,6 @@ id_to_regs = {
     # 8: "r12",
     # 9: "r13",
     # 10: "r14",
-
     0: "rbx",
     1: "r12",
     2: "r13",
@@ -117,13 +119,18 @@ def arg_to_locations(a: arg) -> Set[location]:
         case _:
             return set()
 
+
 class Compiler:
     ############################################################################
     # Shrink
     ############################################################################
 
+    # L_Fun -> L_Fun
+
     def shrink_exp(self, e: expr) -> expr:
         match e:
+            case Call(func, args):
+                return Call(self.shrink_exp(func), [self.shrink_exp(a) for a in args])
             case Constant(_) | Name(_) | Call(Name("input_int"), []):
                 return e
             case UnaryOp(op, exp):
@@ -147,19 +154,25 @@ class Compiler:
                 )
             case Compare(left, [cmp], [right]):
                 return Compare(self.shrink_exp(left), [cmp], [self.shrink_exp(right)])
-            
+
             case ast.Tuple(exps, Load()):
                 return ast.Tuple([self.shrink_exp(e) for e in exps], Load())
             case Subscript(exp, Constant(n), Load()):
                 return Subscript(self.shrink_exp(exp), Constant(n), Load())
             case Call(Name("len"), [exp]):
                 return Call(Name("len"), [self.shrink_exp(exp)])
-            
+
             case _:
                 raise Exception("shrink_exp unexpected: " + repr(e))
 
     def shrink_stmt(self, s: stmt) -> stmt:
         match s:
+            # FIXME: 把 FunctionDef 写在 xxx_stmt 里面, 会导致处理嵌套 FunctionDef, 然而目前只支持 top-level function
+            case FunctionDef(name, args, body, d, returns, t):
+                new_body = [self.shrink_stmt(s) for s in body]
+                return FunctionDef(name, args, new_body, d, returns, t)
+            case Return(exp) if exp is not None:
+                return Return(self.shrink_exp(exp))
             # 处理 subexpression
             case Expr(Call(Name("print"), [exp])):
                 return Expr(Call(Name("print"), [self.shrink_exp(exp)]))
@@ -180,7 +193,202 @@ class Compiler:
                 raise Exception("shrink_stmt unexpected: " + repr(s))
 
     def shrink(self, p: Module) -> Module:
-        return Module([self.shrink_stmt(s) for s in p.body])
+        new_body: list[stmt] = []
+        main_stmt: list[stmt] = []
+        for s in p.body:
+            match s:
+                case FunctionDef(_, _, _, _, _, _):
+                    new_body.append(s)
+                case _:
+                    main_stmt.append(s)
+        main_stmt.append(Return(Constant(0)))
+        main_def = FunctionDef("main", [], main_stmt, None, IntType(), None)
+        new_body.append(main_def)
+        return Module([self.shrink_stmt(s) for s in new_body])
+
+    ############################################################################
+    # Reveal Functions
+    ############################################################################
+
+    # L_Fun -> L_FunRef
+
+    def reveal_exp(self, e: expr, fns: dict[str, int]) -> expr:
+        match e:
+            case Name(var) if var in fns:
+                return FunRef(var, fns[var])
+            case Constant(_) | Name(_) | Call(Name("input_int"), []):
+                return e
+            case BoolOp(op, [left, right]):
+                # shrink pass 去掉了
+                assert False
+                return BoolOp(op, [self.reveal_exp(left), self.reveal_exp(right)])
+            case UnaryOp(op, exp):
+                return UnaryOp(op, self.reveal_exp(exp, fns))
+            case BinOp(left, op, right):
+                return BinOp(
+                    self.reveal_exp(left, fns), op, self.reveal_exp(right, fns)
+                )
+            case Compare(left, [cmp], [right]):
+                return Compare(
+                    self.reveal_exp(left, fns), [cmp], [self.reveal_exp(right, fns)]
+                )
+            case IfExp(cnd, thn, els):
+                return IfExp(
+                    self.reveal_exp(cnd, fns),
+                    self.reveal_exp(thn, fns),
+                    self.reveal_exp(els, fns),
+                )
+            case ast.Tuple(exps, Load()):
+                return ast.Tuple([self.reveal_exp(e, fns) for e in exps], Load())
+            case Subscript(exp, Constant(n), Load()):
+                return Subscript(self.reveal_exp(exp, fns), Constant(n), Load())
+            case Call(Name("len"), [exp]):
+                return Call(Name("len"), [self.reveal_exp(exp, fns)])
+            case Call(Name("print"), [exp]):
+                return Call(Name("print"), [self.reveal_exp(exp, fns)])
+            case Call(Name(_) as fname, args):
+                return Call(
+                    self.reveal_exp(fname, fns),
+                    [self.reveal_exp(a, fns) for a in args],
+                )
+            case _:
+                raise Exception("reveal_exp unexpected: " + repr(e))
+
+    def reveal_stmt(self, s: stmt, fns: dict[str, int]) -> stmt:
+        match s:
+            case FunctionDef(name, args, body, d, returns, t):
+                new_body = [self.reveal_stmt(s, fns) for s in body]
+                return FunctionDef(name, args, new_body, d, returns, t)
+            case Return(e) if e is not None:
+                return Return(self.reveal_exp(e, fns))
+            case If(e, body, orelse):
+                return If(
+                    self.reveal_exp(e, fns),
+                    [self.reveal_stmt(s, fns) for s in body],
+                    [self.reveal_stmt(s, fns) for s in orelse],
+                )
+            case While(test, body, []):
+                new_body = [self.reveal_stmt(s, fns) for s in body]
+                return While(self.reveal_exp(test, fns), new_body, [])
+            case Expr(Call(Name("print"), [exp])):
+                return Expr(Call(Name("print"), [self.reveal_exp(exp, fns)]))
+            case Expr(e):
+                return Expr(self.reveal_exp(e, fns))
+            case Assign([Name(var)], e):
+                return Assign([Name(var)], self.reveal_exp(e, fns))
+            case _:
+                raise Exception("reveal_stmt unexpected: " + repr(s))
+
+    def reveal_functions(self, p: Module) -> Module:
+        fn_narg: dict[str, int] = {}
+        for d in p.body:
+            match d:
+                case FunctionDef(name, args, body, dl, returns, tc):
+                    fn_narg[name] = len(args)  # type: ignore
+
+        new_fns: list[stmt] = []
+        for d in p.body:
+            new_fns.append(self.reveal_stmt(d, fn_narg))
+        return Module(new_fns)
+
+    ############################################################################
+    # Limit Functions
+    ############################################################################
+
+    # L_FunRef -> L_FunRef
+
+    def limit_exp(self, e: expr, arg_map: Dict[str, expr]) -> expr:
+        match e:
+            case Name(var) if var in arg_map:
+                return arg_map[var]
+            case Name(_) | Constant(_) | Call(Name("input_int"), []):
+                return e
+            case Call(func, args):
+                # assert isinstance(func, FunRef)
+                if len(args) > 6:
+                    new_args = [self.limit_exp(a, arg_map) for a in args]
+                    return Call(
+                        func,
+                        new_args[:5]
+                        + [
+                            ast.Tuple(
+                                [new_args[i] for i in range(5, len(args))], Load()
+                            )
+                        ],
+                    )
+                else:
+                    return Call(func, [self.limit_exp(a, arg_map) for a in args])
+            case ast.Tuple(exprs, Load()):
+                return ast.Tuple([self.limit_exp(e, arg_map) for e in exprs], Load())
+            case Subscript(exp, Constant(n), Load()):
+                return Subscript(self.limit_exp(exp, arg_map), Constant(n), Load())
+            case IfExp(cnd, thn, els):
+                return IfExp(
+                    self.limit_exp(cnd, arg_map),
+                    self.limit_exp(thn, arg_map),
+                    self.limit_exp(els, arg_map),
+                )
+            case Compare(left, [cmp], [right]):
+                return Compare(
+                    self.limit_exp(left, arg_map),
+                    [cmp],
+                    [self.limit_exp(right, arg_map)],
+                )
+            case UnaryOp(op, exp):
+                return UnaryOp(op, self.limit_exp(exp, arg_map))
+            case BinOp(left, op, right):
+                return BinOp(
+                    self.limit_exp(left, arg_map), op, self.limit_exp(right, arg_map)
+                )
+            case _:
+                raise Exception("limit_exp unexpected: " + repr(e))
+
+    def limit_stmt(self, s: stmt, arg_map: dict[str, expr]) -> stmt:
+        match s:
+            case FunctionDef(name, args, body, dl, returns, tc):
+                new_arg_map: dict[str, expr] = {}
+                new_args: list[tuple[str, Type]] = args
+
+                if len(args) > 6:
+                    # 只需传递新的 n_arg_map, 因为实现的不是 lexical scope
+                    for i in range(5):
+                        # 忽略 type error, 以 grammer 为准
+                        new_arg_map[args[i][0]] = Name(args[i][0])
+                    for i in range(5, len(args.args)):
+                        new_arg_map[args[i][0]] = Subscript(
+                            Name("tup"), Constant(i - 5), Load()
+                        )
+                    args_tup_type = TupleType([args[i][1] for i in range(5, len(args))])
+                    new_args = args[:5] + [("tup", args_tup_type)]
+
+                new_body = [self.limit_stmt(s, new_arg_map) for s in body]
+                return FunctionDef(name, new_args, new_body, dl, returns, tc)
+
+            case Return(e):
+                return Return(self.limit_exp(e, arg_map))
+            case If(e, body, orelse):
+                return If(
+                    self.limit_exp(e, arg_map),
+                    [self.limit_stmt(s, arg_map) for s in body],
+                    [self.limit_stmt(s, arg_map) for s in orelse],
+                )
+            case While(test, body, []):
+                return While(
+                    self.limit_exp(test, arg_map),
+                    [self.limit_stmt(s, arg_map) for s in body],
+                    [],
+                )
+            case Expr(Call(Name("print"), [exp])):
+                return Expr(Call(Name("print"), [self.limit_exp(exp, arg_map)]))
+            case Expr(e):
+                return Expr(self.limit_exp(e, arg_map))
+            case Assign([Name(var)], e):
+                return Assign([Name(var)], self.limit_exp(e, arg_map))
+            case _:
+                raise Exception("limit_stmt unexpected: " + repr(s))
+
+    def limit_functions(self, p: Module) -> Module:
+        return Module([self.limit_stmt(s, {}) for s in p.body])
 
     ############################################################################
     # Expose Allocation
@@ -233,6 +441,9 @@ class Compiler:
                 return Begin(assigns + [checks, alloc] + sub_assigns, result)  # type: ignore
             case Subscript(exp, Constant(n), Load()):
                 return Subscript(self.expose_exp(exp), Constant(n), Load())
+
+            case Call(func, args):
+                return Call(func, [self.expose_exp(a) for a in args])
             case _:
                 return e
 
@@ -259,17 +470,30 @@ class Compiler:
                 return While(
                     self.expose_exp(test), [self.expose_stmt(s) for s in body], []
                 )
+
+            case Return(e):
+                return Return(self.expose_exp(e))
+
             case _:
                 raise Exception("expose_stmt unexpected: " + repr(s))
 
     def expose_allocation(self, p: Module) -> Module:
-        TypeCheckLtup().type_check(p)  # 收集 has_type
+        TypeCheckLfun().type_check(p)  # 收集 has_type
         assert isinstance(p.body, list)
-        return Module([self.expose_stmt(s) for s in p.body])
+        new_defs = []
+        for s in p.body:
+            match s:
+                case FunctionDef(name, args, body, dl, returns, tc):
+                    new_body = [self.expose_stmt(s) for s in body]
+                    new_defs.append(FunctionDef(name, args, new_body, dl, returns, tc))
+
+        return Module(new_defs)
 
     ############################################################################
     # Remove Complex Operands
     ############################################################################
+
+    # L_FunRef -> L_FunRef^mon
 
     def isatomic(self, e: expr) -> bool:
         match e:
@@ -345,11 +569,29 @@ class Compiler:
                 new_exp, new_temps = self.rco_exp(exp, True)
                 result_expr, result_temps = Call(Name("len"), [new_exp]), new_temps
 
+            case FunRef(_, _):
+                result_expr, result_temps = e, []
+            case Call(exp, args):
+                new_fn, fn_temps = self.rco_exp(exp, True)
+
+                new_args = []
+                args_temps = []
+                for a in args:
+                    new_a, a_temps = self.rco_exp(a, True)
+                    new_args.append(new_a)
+                    args_temps += a_temps
+
+                result_expr = Call(new_fn, new_args)
+                result_temps = fn_temps + args_temps
             case _:
                 raise Exception("rco_exp unexpected: " + repr(e))
 
         if need_atomic:
-            tmp = generate_name("tmp")
+            tmp = ""
+            if isinstance(e, FunRef):
+                tmp = generate_name("fun")
+            else:
+                tmp = generate_name("tmp")
             result_expr, result_temps = Name(tmp), result_temps + [
                 (Name(tmp), result_expr)
             ]
@@ -376,7 +618,7 @@ class Compiler:
             case While(test, body, []):
                 new_test, temps = self.rco_exp(test, False)
                 new_body = [new_s for s in body for new_s in self.rco_stmt(s)]
-                return make_assigns(temps) + [While(new_test, new_body, [])] # type: ignore
+                return make_assigns(temps) + [While(new_test, new_body, [])]  # type: ignore
 
             case Assign([Subscript(lhs, index, Store())], rhs):
                 lhs_atm, lhs_temps = self.rco_exp(lhs, True)
@@ -385,20 +627,31 @@ class Compiler:
                 return make_assigns(lhs_temps + index_temps + rhs_temps) + [Assign([Subscript(lhs_atm, index_atm, Store())], rhs_atm)]  # type: ignore
             case Collect(_):
                 return [s]
+
+            case Return(e):
+                new_exp, temps = self.rco_exp(e, False)
+                return make_assigns(temps) + [Return(new_exp)]  # type: ignore
+            case FunctionDef(name, args, body, dl, returns, tc):
+                new_body = [new_s for s in body for new_s in self.rco_stmt(s)]
+                return [FunctionDef(name, args, new_body, dl, returns, tc)]
             case _:
                 raise Exception("rco_stmt unexpected: " + repr(s))
 
     def remove_complex_operands(self, p: Module) -> Module:
-        match p:
-            case Module(body):
-                return Module([new_s for s in body for new_s in self.rco_stmt(s)])
-            case _:
-                raise Exception("remove_complex_operands unexpected: " + repr(p))
+        new_defs = []
+        for s in p.body:
+            match s:
+                case FunctionDef(name, args, body, dl, returns, tc):
+                    new_body = [new_s for s in body for new_s in self.rco_stmt(s)]
+                    new_defs.append(FunctionDef(name, args, new_body, dl, returns, tc))
 
-    
+        return Module(new_defs)
+
     ############################################################################
     # Explicate Control
     ############################################################################
+
+    # L_FunRef^mon -> C_Fun
 
     def create_block(
         self, stmts: List[stmt], basic_block: Dict[str, List[stmt]]
@@ -414,7 +667,11 @@ class Compiler:
     # generates code for an if expression or statement by analyzing the condition expression
     # 返回 `stmt` ... If(Compare(atm, [cmp], [atm]), [Goto(label)], [Goto(label)])
     def explicate_pred(
-        self, cnd: expr, thn: List[stmt], els: List[stmt], basic_blocks: Dict[str, List[stmt]]
+        self,
+        cnd: expr,
+        thn: List[stmt],
+        els: List[stmt],
+        basic_blocks: Dict[str, List[stmt]],
     ) -> List[stmt]:
         match cnd:
             case Compare(left, [op], [right]):
@@ -452,6 +709,11 @@ class Compiler:
                     basic_blocks,
                 )
 
+            case Call(func, args):
+                tmp = generate_name("tmp")
+                gen_pred = self.explicate_pred(Name(tmp), thn, els, basic_blocks)
+                return self.explicate_assign(cnd, Name(tmp), gen_pred, basic_blocks)
+
             case _:
                 return [
                     If(
@@ -469,7 +731,7 @@ class Compiler:
     ) -> List[stmt]:
         match e:
             case Begin(body, result):
-                begin_block = self.explicate_effect(result, cont, basic_blocks) + cont
+                begin_block = self.explicate_effect(result, cont, basic_blocks)
                 for s in reversed(body):
                     begin_block = self.explicate_stmt(s, begin_block, basic_blocks)
                 return begin_block
@@ -480,17 +742,21 @@ class Compiler:
                 body_ss = self.explicate_effect(body, goto_cont, basic_blocks)
                 orelse_ss = self.explicate_effect(orelse, goto_cont, basic_blocks)
                 return self.explicate_pred(test, body_ss, orelse_ss, basic_blocks)
-            case Call(func, args):
+            case Call(_, _):
                 return [Expr(e)] + cont
 
             case GlobalValue(_) | Allocate(_, _):
                 return cont
+
+            case FunRef(_, _):
+                return cont
+
             case _:
                 return cont
 
     # generates code for expressions on the right-hand side of an assignment
     # 处理 Assign statement
-    # 返回 C_If stmts
+    # 返回 C_Fun stmts
     def explicate_assign(
         self,
         rhs: expr,
@@ -517,18 +783,44 @@ class Compiler:
             case _:
                 return [Assign([lhs], rhs)] + cont
 
+    # 转换 Return(e)
+    def explicate_tail(
+        self, e: expr, basic_blocks: Dict[str, List[stmt]]
+    ) -> List[stmt]:
+        match e:
+            case Begin(body, result):
+                cont = self.explicate_tail(result, basic_blocks)
+                for s in reversed(body):
+                    cont = self.explicate_stmt(s, cont, basic_blocks)
+                return cont
+            case IfExp(test, thn, els):
+                new_thn = self.explicate_tail(thn, basic_blocks)
+                new_els = self.explicate_tail(els, basic_blocks)
+                return self.explicate_pred(test, new_thn, new_els, basic_blocks)
+            # Call(atm, atm*)
+            case Call(Name(func), args) if func not in ["input_int", "len", "print"]:
+                return [TailCall(Name(func), args)]
+
+            case _:
+                tmp = Name(generate_name("return"))
+                return self.explicate_assign(e, tmp, [Return(tmp)], basic_blocks)
+
     # generates code for statements
+    # 返回的 List[stmt] 作为新的 continuation
     def explicate_stmt(
         self, s: stmt, cont: List[stmt], basic_blocks: Dict[str, List[stmt]]
     ) -> List[stmt]:
         match s:
+            case Return(e):
+                return self.explicate_tail(e, basic_blocks)
+
             case Collect(_) | Assign([Subscript(_, _, Store())], _):
                 return [s] + cont
             case Assign([lhs], rhs):
                 return self.explicate_assign(rhs, lhs, cont, basic_blocks)
             # expression-statement
-            case Expr(value):
-                return self.explicate_effect(value, cont, basic_blocks)
+            case Expr(e):
+                return self.explicate_effect(e, cont, basic_blocks)
             case If(test, body, orelse):
                 goto_cont = self.create_block(cont, basic_blocks)
                 body_ss = goto_cont
@@ -542,38 +834,45 @@ class Compiler:
             case While(test, body, []):
                 goto_cont = self.create_block(cont, basic_blocks)
 
-                label = label_name(generate_name('loop'))
+                label = label_name(generate_name("loop"))
 
                 body_ss: list[stmt] = [Goto(label)]
                 for s in reversed(body):
                     body_ss = self.explicate_stmt(s, body_ss, basic_blocks)
 
-                test_ss =  self.explicate_pred(test, body_ss, goto_cont, basic_blocks)
+                test_ss = self.explicate_pred(test, body_ss, goto_cont, basic_blocks)
                 basic_blocks[label] = test_ss
                 return [Goto(label)]
 
             case _:
                 raise Exception("explicate_stmt unexpected: " + repr(s))
 
-    # Expr(Call(Name('print'), [Name('tmp.0')]))
-    def explicate_control(self, p: X86Program) -> CProgram:
-        match p:
-            case Module(body):
+    def explicate_def(self, d: FunctionDef) -> FunctionDef:
+        match d:
+            case FunctionDef(name, args, body, dl, returns, tc):
                 basic_blocks: dict[str, list[stmt]] = {}
-                new_body: list[stmt] = [Return(Constant(0))]
-                # 倒序编译
+
+                basic_blocks[label_name(f"{name}_conclusion")] = []
+
+                new_body: list[stmt] = [Goto(label_name(f"{name}_conclusion"))]
                 for s in reversed(body):
                     new_body = self.explicate_stmt(s, new_body, basic_blocks)
-                basic_blocks[label_name("start")] = new_body
-                return CProgram(basic_blocks)
-            case _:
-                raise Exception("explicate_control unexpected: " + repr(p))
+                basic_blocks[label_name(f"{name}_start")] = new_body
 
+                return FunctionDef(name, args, basic_blocks, dl, returns, tc)
+            case _:
+                raise Exception("explicate_def unexpected: " + repr(d))
+
+    def explicate_control(self, p: Module) -> CProgramDefs:
+        return CProgramDefs([self.explicate_def(d) for d in p.body])
 
     ############################################################################
     # Select Instructions
     ############################################################################
 
+    # C_Fun -> x86_callq*^Def
+
+    # atomic to arg
     def select_arg(self, e: expr) -> arg:
         match e:
             case Constant(True):
@@ -589,8 +888,51 @@ class Compiler:
             case _:
                 raise Exception("select_arg unexpected: " + repr(e))
 
-    def select_stmt(self, s: stmt) -> List[instr]:
+    def select_stmt(self, s: stmt, curr_fn: Optional[str] = None) -> List[instr]:
         match s:
+            # L_Fun
+            case Assign([Name(var) as v], FunRef(label, _)):
+                return [Instr("leaq", [Global(label_name(label)), self.select_arg(v)])]  # type: ignore
+            # user-defined function
+            case Assign([Name(var)], Call(Name(func), args)) if func not in [
+                "input_int",
+                "len",
+            ]:
+                result = []
+                for i, arg in enumerate(args):
+                    result.append(
+                        Instr("movq", [self.select_arg(arg), Reg(arg_passing_regs[i])])
+                    )
+                result.append(IndirectCallq(Variable(func), len(args)))
+                result.append(Instr("movq", [Reg("rax"), Variable(var)]))
+                return result
+            # user-defined function
+            case Expr(Call(Name(func), args)) if func not in [
+                "input_int",
+                "len",
+                "print",
+            ]:
+                result = []
+                for i, arg in enumerate(args):
+                    result.append(
+                        Instr("movq", [self.select_arg(arg), Reg(arg_passing_regs[i])])
+                    )
+                result.append(IndirectCallq(Variable(func), len(args)))
+                return result
+            case TailCall(Name(func), args):
+                result = []
+                for i, arg in enumerate(args):
+                    result.append(
+                        Instr("movq", [self.select_arg(arg), Reg(arg_passing_regs[i])])
+                    )
+                result.append(TailJump(Variable(func), len(args)))
+                return result
+            case Return(atm):
+                assert curr_fn is not None
+                return [
+                    Instr("movq", [self.select_arg(atm), Reg("rax")]),
+                    Jump(label_name(f"{curr_fn}_conclusion")),
+                ]  # type: ignore
             # L_Tup
             case Assign([Name(var)], GlobalValue(gv)):
                 return [Instr("movq", [Global(gv), Variable(var)])]  # type: ignore
@@ -646,9 +988,10 @@ class Compiler:
                     Instr("movq", [arg, Reg("rdi")]),
                     Callq(label_name("print_int"), 1),
                 ]
-            # side effect
+
             case Expr(Call(Name("input_int"), [])):
                 return [Callq(label_name("read_int"), 0)]
+
             case Assign([Name(_)], _):
                 return self.select_stmt_assign(s)
 
@@ -663,7 +1006,7 @@ class Compiler:
                     JumpIf(cc, thn),
                     Jump(els),
                 ]
-            # TODO: type error
+
             case Return(exp):
                 return [
                     Instr("movq", [self.select_arg(exp), Reg("rax")]),  # type: ignore
@@ -738,17 +1081,76 @@ class Compiler:
             case _:
                 raise Exception("select_stmt_assign unexpected: " + repr(s))
 
-    
-    def select_instructions(self, p: Module) -> X86Program:
-        TypeCheckCtup().type_check(p)
-        self.var_types = p.var_types  # type: ignore
+    def select_instructions(self, p: CProgramDefs) -> X86ProgramDefs:
+        # var_types 在 FunctionDef 上
+        TypeCheckCfun().type_check(p)
 
-        new_body = {}
-        for bb, stmts in p.body.items():  # type: ignore
-            instrs = [i for s in stmts for i in self.select_stmt(s)]
-            new_body[bb] = instrs
-        return X86Program(new_body)
-    
+        new_defs = []
+        for d in p.defs:
+            match d:
+                case FunctionDef(name, args, blocks, dl, returns, tc):
+                    # 传递给 select_stmt 使用
+                    self.var_types = d.var_types
+
+                    assert isinstance(blocks, dict)
+                    new_blocks: dict[str, list[instr]] = {}
+                    for label, body in blocks.items():
+                        new_blocks[label] = [
+                            ns for s in body for ns in self.select_stmt(s, name)
+                        ]
+
+                    arg_passing_stmts = []
+                    for i, arg in enumerate(args):
+                        arg_passing_stmts.append(
+                            Instr("movq", [Reg(arg_passing_regs[i]), Variable(arg[0])])
+                        )
+
+                    # FIXME: 如果想在模拟器运行, 需要处理函数变量被覆盖(非 tail call 的情况).
+
+                    call_init = []
+                    init_rootstack = []
+                    if name == "main":
+                        call_init = [
+                            # Instr("movq", [Immediate(65536), Reg("rdi")]),
+                            # Instr("movq", [Immediate(65536), Reg("rsi")]),
+                            # Callq(label_name("initialize"), 2),
+                        ]
+                        init_rootstack = [
+                            Instr(
+                                "movq",
+                                [Global(label_name("rootstack_begin")), Reg("r15")],
+                            ),
+                        ]
+
+                    new_blocks[label_name(f"{name}_start")] = (
+                        arg_passing_stmts + new_blocks[label_name(f"{name}_start")]
+                    )
+
+                    prelude = [
+                        Instr("pushq", [Reg("rbp")]),
+                        Instr("movq", [Reg("rsp"), Reg("rbp")]),
+                    ]
+                    new_blocks[label_name(f"{name}")] = (
+                        prelude
+                        + call_init
+                        + init_rootstack
+                        + [Jump(label_name(f"{name}_start"))]
+                    )
+
+                    new_blocks[label_name(f"{name}_conclusion")] = [
+                        Instr("popq", [Reg("rbp")]),
+                        Instr("retq", []),
+                    ]
+
+                    new_def = FunctionDef(name, [], new_blocks, dl, returns, tc)
+
+                    # 拷贝 var_types
+                    new_def.var_types = d.var_types
+
+                    new_defs.append(new_def)
+
+        return X86ProgramDefs(new_defs)
+
     ###########################################################################
     # Uncover Live
     ###########################################################################
@@ -780,6 +1182,11 @@ class Compiler:
                 return arg_to_locations(s) | arg_to_locations(d)
             case Instr("sarq", [s, d]):
                 return arg_to_locations(s) | arg_to_locations(d)
+
+            case IndirectCallq(reg, narg):
+                return set([Reg(r) for r in arg_passing_regs[:narg]]) | {reg}
+            case TailJump(reg, narg):
+                return set([Reg(r) for r in arg_passing_regs[:narg]]) | {reg}
             case _:
                 return set()
 
@@ -811,11 +1218,18 @@ class Compiler:
                 return arg_to_locations(d)
             case Instr("sarq", [s, d]):
                 return arg_to_locations(d)
+
+            case IndirectCallq(label, narg):
+                return set([Reg(r) for r in caller_saved_regs])
+            case TailJump(label, narg):
+                return set([Reg(r) for r in caller_saved_regs])
             case _:
                 return set()
 
     # live_after 是 basic blocks CFG 中当前结点后继结点的 live_before_block 的 join
-    def transfer(self, ss: List[instr], label: str, live_after_block: Set[location]) -> Set[location]:
+    def transfer(
+        self, ss: List[instr], label: str, live_after_block: Set[location]
+    ) -> Set[location]:
         if len(ss) == 0:
             return set()
 
@@ -826,37 +1240,47 @@ class Compiler:
                 self.live_before[ss[-1]] = live_after_block
             case JumpIf(_, _):
                 self.live_after[ss[-1]] = live_after_block
-                tmp = (self.live_after[ss[-1]] - self.write_vars(ss[-1])) | self.read_vars(ss[-1])
+                tmp = (
+                    self.live_after[ss[-1]] - self.write_vars(ss[-1])
+                ) | self.read_vars(ss[-1])
                 self.live_before[ss[-1]] = tmp.union(live_after_block)
             case _:
                 # self.live_after[ss[-1]] = live_after_block
                 self.live_after[ss[-1]] = set()
-                self.live_before[ss[-1]] = (self.live_after[ss[-1]] - self.write_vars(ss[-1])) | self.read_vars(ss[-1])
-        
+                self.live_before[ss[-1]] = (
+                    self.live_after[ss[-1]] - self.write_vars(ss[-1])
+                ) | self.read_vars(ss[-1])
+
         for i, inst in list(reversed(list(enumerate(ss))))[1:]:
-            self.live_after[inst] = self.live_before[ss[i+1]]
+            self.live_after[inst] = self.live_before[ss[i + 1]]
             match inst:
                 case Jump(_):
                     self.live_before[inst] = live_after_block
                 case JumpIf(_, _):
-                    tmp = (self.live_after[inst] - self.write_vars(inst)) | self.read_vars(inst)
+                    tmp = (
+                        self.live_after[inst] - self.write_vars(inst)
+                    ) | self.read_vars(inst)
                     self.live_before[inst] = tmp.union(live_after_block)
                 case _:
-                    self.live_before[inst] = (self.live_after[inst] - self.write_vars(inst)) | self.read_vars(inst)
+                    self.live_before[inst] = (
+                        self.live_after[inst] - self.write_vars(inst)
+                    ) | self.read_vars(inst)
 
         return self.live_before[ss[0]]
 
-    def uncover_live(self, p: X86Program) -> Dict[instr, Set[location]]:
-        assert isinstance(p.body, dict)
-        basic_blocks = p.body
-        cfg = build_cfg(p.body)
+    def uncover_live(
+        self, basic_blocks: Dict[str, List[instr]]
+    ) -> Dict[instr, Set[location]]:
+        cfg = build_cfg(basic_blocks)
 
         self.live_before: dict[instr, set[location]] = {}
         self.live_after: dict[instr, set[location]] = {}
 
         analyze_dataflow(
-            transpose(cfg), # 得是转置的
-            lambda label, live_after: self.transfer(basic_blocks[label], label, live_after),
+            transpose(cfg),  # 得是转置的
+            lambda label, live_after: self.transfer(
+                basic_blocks[label], label, live_after
+            ),
             set(),
             lambda x, y: x.union(y),
         )
@@ -868,17 +1292,17 @@ class Compiler:
     ############################################################################
 
     def build_interference(
-        self, p: X86Program, live_after: Dict[instr, Set[location]]
+        self,
+        basic_blocks: Dict[str, List[instr]],
+        live_after: Dict[instr, Set[location]],
     ) -> UndirectedAdjList:
-        assert isinstance(p.body, dict)
-
         g = UndirectedAdjList()
 
         for _, locs in live_after.items():
             for loc in locs:
                 g.add_vertex(loc)
 
-        for _, instrs in p.body.items():
+        for _, instrs in basic_blocks.items():
             for inst in instrs:
                 match inst:
                     case Instr("movq", [s, d]) | Instr("movzbq", [s, d]) if islocation(
@@ -894,6 +1318,15 @@ class Compiler:
                                     g.add_edge(d, v)
 
                         match inst:
+                            case IndirectCallq(_, _) | TailJump(_, _):
+                                for v in live_after[inst]:
+                                    match v:
+                                        case Variable(var):
+                                            match self.var_types[var]:
+                                                case TupleType(_):
+                                                    for r in callee_saved_regs:
+                                                        g.add_edge(v, Reg(r))
+
                             case Callq(func, _):
                                 for v in live_after[inst]:
                                     for r in caller_saved_regs:
@@ -1006,7 +1439,7 @@ class Compiler:
                 raise Exception("filter_var unexpected: " + repr(v))
 
     def allocate_registers(
-        self, p: X86Program, g: UndirectedAdjList
+        self, p: FunctionDef, g: UndirectedAdjList
     ) -> Tuple[Dict[location, arg], Dict[Variable, arg]]:
         coloring_reg, spilled = self.color_graph(
             g,
@@ -1029,6 +1462,7 @@ class Compiler:
                     if r in callee_saved_regs:
                         self.used_callee.append(r)
         self.used_callee = list(set(self.used_callee))  # 去重
+        # print(f"===({p.name}) used_callee: {self.used_callee}")
 
         # variable -> stack
         spilled_home: dict[Variable, arg] = {}
@@ -1036,10 +1470,13 @@ class Compiler:
             match var:
                 case Variable(v):
                     # 减去 used_callee size
-                    spilled_home[var] = Deref("rbp", -8 * (i + 1) - 8 * len(self.used_callee))
+                    spilled_home[var] = Deref(
+                        "rbp", -8 * (i + 1) - 8 * len(self.used_callee)
+                    )
                 case _:
                     raise Exception("allocate_registers: spilled should be Variable")
         self.spilled_size = len(spilled_home) * 8
+        # print(f"===({p.name}) spilled_size: {self.spilled_size}")
 
         # variable -> rootstack
         rootstack_home: dict[Variable, arg] = {}
@@ -1054,19 +1491,22 @@ class Compiler:
                     #     continue
                     match self.var_types[var]:
                         case TupleType(_):
-                            assert (v not in spilled_home)
+                            assert v not in spilled_home
                             if v in rootstack_home:
                                 continue
                             rootstack_home[v] = Deref("r15", 8 * rootstack_count)
                             rootstack_count += 1
                             # print(f"{v} => {rootstack_home[v]}")
-        self.roostack_size = rootstack_count * 8
+        self.rootstack_size = rootstack_count * 8
+        # print(f"===({p.name}) rootstack_size: {self.rootstack_size}")
 
         return coloring_reg_home, {**spilled_home, **rootstack_home}  # type: ignore
 
     ############################################################################
     # Assign Homes
     ############################################################################
+
+    # x86_callq*^(Var,Def) -> x86_callq*^(Var,Def)
 
     def assign_homes_arg(self, a: arg, home: Dict[Variable, arg]) -> arg:
         match a:
@@ -1083,6 +1523,8 @@ class Compiler:
                     home[var] = Deref("rbp", -self.spilled_size)
                     print(f"assign_homes_arg: ({var}) => ({home[var]})")
                     return home[var]
+            case FunRef(_, _):
+                return a
             case _:
                 return a
                 # raise Exception("assign_homes_arg unexpected " + repr(a))
@@ -1101,31 +1543,46 @@ class Compiler:
                 )
             case Callq(_, _):
                 return i
+            case IndirectCallq(func, narg):
+                return IndirectCallq(self.assign_homes_arg(func, home), narg)
+            case TailJump(func, narg):
+                return TailJump(self.assign_homes_arg(func, home), narg)
             case _:
                 return i
                 # raise Exception("assign_homes_instr unexpected " + repr(i))
-    
-    def assign_homes(self, pseudo_x86: X86Program) -> X86Program:
-        assert isinstance(pseudo_x86.body, dict)
 
-        # 手动补充一个 conclusion block
-        pseudo_x86.body[label_name("conclusion")] = []
+    def assign_homes(self, p: X86ProgramDefs) -> X86ProgramDefs:
+        new_defs = []
+        for d in p.defs:
+            match d:
+                case FunctionDef(name, args, blocks, dl, returns, tc):
+                    assert isinstance(blocks, dict)
+                    self.var_types = d.var_types
+                    live_after = self.uncover_live(blocks)
+                    g = self.build_interference(blocks, live_after)
+                    coloring_home, spilled_home = self.allocate_registers(d, g)
+                    home = {**coloring_home, **spilled_home}
 
-        live_after = self.uncover_live(pseudo_x86)
-        g = self.build_interference(pseudo_x86, live_after)
-        coloring_home, spilled_home = self.allocate_registers(pseudo_x86, g)
-        home = {**coloring_home, **spilled_home}
+                    new_blocks: dict[str, list[instr]] = {}
+                    for label, body in blocks.items():
+                        new_blocks[label] = [
+                            self.assign_homes_instr(i, home) for i in body  # type: ignore
+                        ]
 
-        new_body: dict[str, list[instr]] = {}
-        for bb, instrs in pseudo_x86.body.items():
-            new_body[bb] = [self.assign_homes_instr(i, home) for i in instrs]  # type: ignore
+                    new_def = FunctionDef(name, args, new_blocks, dl, returns, tc)
+                    new_def.var_types = d.var_types
+                    new_def.used_callee = self.used_callee
+                    new_def.spilled_size = self.spilled_size
+                    new_def.rootstack_size = self.rootstack_size
+                    new_defs.append(new_def)
 
-        return X86Program(new_body)
+        return X86ProgramDefs(new_defs)
 
-    
     ############################################################################
     # Patch Instructions
     ############################################################################
+
+    # x86_callq*^(Var,Def) -> x86_callq*^(Def)
 
     def patch_instr(self, i: instr) -> List[instr]:
         match i:
@@ -1133,18 +1590,21 @@ class Compiler:
                 return [Instr("movq", [imm, Reg("rax")]), Instr(op, [Reg("rax")])]
             case Instr(op, [_]):
                 return [i]
-            case Instr(op, [arg1, arg2]):
-                match (arg1, arg2):
+            case Instr(op, [arg, arg2]):
+                match (arg, arg2):
                     case (Deref(_, _) as deref1, Deref(_, _) as deref2):
                         return [
                             Instr("movq", [deref1, Reg("rax")]),
                             Instr(op, [Reg("rax"), deref2]),
                         ]
                     # TODO: Global 类似于 Deref?
-                    case (Deref(_, _) | x86_ast.Global(_), Deref(_, _) | x86_ast.Global(_)):
+                    case (
+                        Deref(_, _) | x86_ast.Global(_),
+                        Deref(_, _) | x86_ast.Global(_),
+                    ):
                         return [
-                            Instr("movq", [arg1, Reg("rax")]),
-                            Instr(op, [Reg("rax"), arg2])
+                            Instr("movq", [arg, Reg("rax")]),
+                            Instr(op, [Reg("rax"), arg2]),
                         ]
                     case (Immediate(n) as imm, _) if n > 2**16:
                         return [
@@ -1155,7 +1615,7 @@ class Compiler:
                     case (_, Immediate(n) as imm) if n > 2**16:
                         return [
                             Instr("movq", [imm, Reg("rax")]),
-                            Instr(op, [arg1, Reg("rax")]),
+                            Instr(op, [arg, Reg("rax")]),
                         ]
                     case _:
                         return [i]
@@ -1165,92 +1625,181 @@ class Compiler:
             case Instr("cmpq", [arg, Immediate(n)]):
                 return [
                     Instr("movq", [Immediate(n), Reg("rax")]),
-                    Instr("cmpq", [arg, Reg("rax")])
+                    Instr("cmpq", [arg, Reg("rax")]),
                 ]
             case Instr("movbzq", [arg, Deref(reg, off)]):
                 return [
                     Instr("movbzq", [arg, Reg("rax")]),
-                    Instr("movq", [Reg("rax"), Deref(reg, off)])
+                    Instr("movq", [Reg("rax"), Deref(reg, off)]),
                 ]
             case Jump(_):
                 return [i]
+            case IndirectCallq(_, _):
+                return [i]
+            case Instr("leaq", [arg, Deref(reg, offset)]):
+                return [
+                    Instr("leaq", [arg, Reg("rax")]),
+                    Instr("movq", [Reg("rax"), Deref(reg, offset)]),
+                ]
+            case TailJump(arg, narg) if arg != Reg("rax"):
+                return [Instr("movq", [arg, Reg("rax")]), TailJump(Reg("rax"), narg)]
             case _:
                 return [i]
                 # raise Exception("patch_instr unexpected: " + repr(i))
 
-    def patch_instructions(self, p: X86Program) -> X86Program:
-        assert isinstance(p.body, dict)
+    def patch_instructions(self, p: X86ProgramDefs) -> X86ProgramDefs:
+        new_defs = []
+        for d in p.defs:
+            match d:
+                case FunctionDef(name, _, blocks, dl, returns, tc):
+                    assert isinstance(blocks, dict)
+                    new_blocks: dict[str, list[instr]] = {}
+                    for label, body in blocks.items():
+                        filtered_instrs = []
+                        for inst in body:
+                            match inst:
+                                case Instr(
+                                    "movq", [Deref(_, _) as d1, Deref(_, _) as d2]
+                                ) if d1 == d2:
+                                    continue
+                                case Instr("movq", [Reg(r1), Reg(r2)]) if r1 == r2:
+                                    continue
+                                case _:
+                                    filtered_instrs.append(inst)
+                        new_blocks[label] = [
+                            ni for i in filtered_instrs for ni in self.patch_instr(i)
+                        ]
+                    new_def = FunctionDef(name, [], new_blocks, dl, returns, tc)
+                    new_def.var_types = d.var_types
+                    new_def.used_callee = d.used_callee
+                    new_def.spilled_size = d.spilled_size
+                    new_def.rootstack_size = d.rootstack_size
+                    new_defs.append(new_def)
 
-        new_body = {}
-        for bb, instrs in p.body.items():
-            filtered_instrs = []
-            for inst in instrs:
-                match inst:
-                    case Instr("movq", [Deref(_, _) as d1, Deref(_, _) as d2]) if d1 == d2:
-                        continue
-                    case Instr("movq", [Reg(r1), Reg(r2)]) if r1 == r2:
-                        continue
-                    case _:
-                        filtered_instrs.append(inst)
-            new_body[bb] = [ii for i in filtered_instrs for ii in self.patch_instr(i)]
-
-        return X86Program(new_body)
+        return X86ProgramDefs(new_defs)
 
     ###########################################################################
     # Prelude & Conclusion
     ###########################################################################
 
-    def prelude_and_conclusion(self, p: X86Program) -> X86Program:
-        # print(f"===used_callee: {self.used_callee}")
-        # print(f"===spilled_size: {self.spilled_size}")
-        # print(f"===rootstack_size: {self.roostack_size}")
-        assert isinstance(p.body, dict)
-        used_callee_size = len(self.used_callee) * 8
-        rsp_aligned = align(self.spilled_size + used_callee_size, 16) - used_callee_size
-        # print(f"===rsp_aligned: {rsp_aligned}")
+    # x86_callq*^(Def) -> x86_callq*
 
-        prelude = [
-            Instr("pushq", [Reg("rbp")]),
-            Instr("movq", [Reg("rsp"), Reg("rbp")]),
-        ]
-        prelude += [Instr("pushq", [Reg(r)]) for r in self.used_callee]
-        if rsp_aligned > 0:
-            prelude += [Instr("subq", [Immediate(rsp_aligned), Reg("rsp")])]
+    def prelude_and_conclusion(self, p: X86ProgramDefs) -> X86Program:
+        new_basic_blocks: dict[str, list[instr]] = {}
+        for d in p.defs:
+            match d:
+                case FunctionDef(name, _, blocks, dl, returns, tc):
+                    assert isinstance(blocks, dict)
+                    print(f"===({d.name}) used_callee: {d.used_callee}")
+                    print(f"===({d.name}) spilled_size: {d.spilled_size}")
+                    print(f"===({d.name}) rootstack_size: {d.rootstack_size}")
+                    used_callee_size = len(d.used_callee) * 8
+                    rsp_aligned = (
+                        align(d.spilled_size + used_callee_size, 16) - used_callee_size
+                    )
+                    print(f"===({d.name}) rsp_aligned: {rsp_aligned}")
 
-        call_init = [
-            Instr("movq", [Immediate(65536), Reg("rdi")]),
-            Instr("movq", [Immediate(65536), Reg("rsi")]),
-            Callq(label_name("initialize"), 2),
-        ]
-        init_rootstack = [
-            Instr("movq", [Global(label_name("rootstack_begin")), Reg("r15")]),
-        ]
-        if self.roostack_size > 0:
-            for i in range(self.roostack_size // 8):
-                init_rootstack.append(
-                    # Instr("movq", [Immediate(0), Deref("r15", 8 * i)])
-                    Instr("movq", [Immediate(0), Deref("r15", 0)])
-                )
-                init_rootstack.append(
-                    Instr("addq", [Immediate(8), Reg("r15")])
-                )
-            # init_rootstack.append(
-            #     Instr("addq", [Immediate(self.roostack_size), Reg("r15")])
-            # )
-        p.body[label_name("main")] = (
-            prelude + call_init + init_rootstack + [Jump(label_name("start"))]
-        )
+                    # efficient tail jump
+                    for label, body in blocks.items():
+                        new_body = []
+                        for s in body:
+                            match s:
+                                case TailJump(func, _):
+                                    tailcall_conclusion = [
+                                        Instr("popq", [Reg(r)])
+                                        for r in reversed(d.used_callee)
+                                    ] + [
+                                        Instr("popq", [Reg("rbp")]),
+                                        IndirectJump(func),
+                                    ]
+                                    if rsp_aligned > 0:
+                                        tailcall_conclusion.insert(
+                                            0,
+                                            Instr(
+                                                "addq",
+                                                [Immediate(rsp_aligned), Reg("rsp")],
+                                            ),
+                                        )
+                                    if d.rootstack_size > 0:
+                                        tailcall_conclusion.insert(
+                                            0,
+                                            Instr(
+                                                "subq",
+                                                [
+                                                    Immediate(d.rootstack_size),
+                                                    Reg("r15"),
+                                                ],
+                                            ),
+                                        )
+                                    new_body += tailcall_conclusion
+                                case _:
+                                    new_body.append(s)
 
-        conclusion = [Instr("popq", [Reg(r)]) for r in reversed(self.used_callee)] + [
-            Instr("popq", [Reg("rbp")]),
-            Instr("retq", []),
-        ]
-        if rsp_aligned > 0:
-            conclusion.insert(0, Instr("addq", [Immediate(rsp_aligned), Reg("rsp")]))
-        if self.roostack_size > 0:
-            conclusion.insert(
-                0, Instr("subq", [Immediate(self.roostack_size), Reg("r15")])
-            )
-        p.body[label_name("conclusion")] = conclusion
+                        blocks[label] = new_body
 
-        return X86Program(p.body)  # type: ignore
+                    # 1
+                    prelude = [
+                        Instr("pushq", [Reg("rbp")]),
+                        Instr("movq", [Reg("rsp"), Reg("rbp")]),
+                    ]
+                    # 2
+                    prelude += [Instr("pushq", [Reg(r)]) for r in d.used_callee]
+                    # 3
+                    if rsp_aligned > 0:
+                        prelude += [Instr("subq", [Immediate(rsp_aligned), Reg("rsp")])]
+
+                    # 3.5
+                    call_init = []
+                    init_rootstack = []
+                    if name == "main":
+                        call_init = [
+                            Instr("movq", [Immediate(65536), Reg("rdi")]),
+                            Instr("movq", [Immediate(65536), Reg("rsi")]),
+                            Callq(label_name("initialize"), 2),
+                        ]
+                        init_rootstack = [
+                            Instr(
+                                "movq",
+                                [Global(label_name("rootstack_begin")), Reg("r15")],
+                            ),
+                        ]
+                    # 4
+                    if d.rootstack_size > 0:
+                        for i in range(d.rootstack_size // 8):
+                            init_rootstack.append(
+                                # Instr("movq", [Immediate(0), Deref("r15", 8 * i)])
+                                Instr("movq", [Immediate(0), Deref("r15", 0)])
+                            )
+                            # 5
+                            init_rootstack.append(
+                                Instr("addq", [Immediate(8), Reg("r15")])
+                            )
+                        # init_rootstack.append(
+                        #     Instr("addq", [Immediate(self.rootstack_size), Reg("r15")])
+                        # )
+                    blocks[label_name(f"{name}")] = (
+                        prelude
+                        + call_init
+                        + init_rootstack
+                        + [Jump(label_name(f"{name}_start"))]
+                    )
+
+                    conclusion = [
+                        Instr("popq", [Reg(r)]) for r in reversed(d.used_callee)
+                    ] + [
+                        Instr("popq", [Reg("rbp")]),
+                        Instr("retq", []),
+                    ]
+                    if rsp_aligned > 0:
+                        conclusion.insert(
+                            0, Instr("addq", [Immediate(rsp_aligned), Reg("rsp")])
+                        )
+                    if d.rootstack_size > 0:
+                        conclusion.insert(
+                            0, Instr("subq", [Immediate(d.rootstack_size), Reg("r15")])
+                        )
+                    blocks[label_name(f"{name}_conclusion")] = conclusion
+
+                    new_basic_blocks = {**new_basic_blocks, **blocks}
+
+        return X86Program(new_basic_blocks)

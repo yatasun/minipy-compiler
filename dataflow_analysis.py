@@ -2,12 +2,11 @@ from collections import deque
 from typing import Dict, List
 from graph import DirectedAdjList, transpose
 from functools import reduce
-from utils import trace
 from x86_ast import Jump, JumpIf, instr
 
 def analyze_dataflow(G, transfer, bottom, join):
     trans_G = transpose(G)
-    # mapping 是 live_before_block
+    # liveness analysis: mapping 是 live_before_block
     mapping = {}
     for v in G.vertices():
         mapping[v] = bottom

@@ -11,6 +11,6 @@ runtime.o: runtime.c
 lldb:
 	lldb a.out
 debug:
-	lldb a.out -o "br s -n print_int" -o "b main"
+	lldb a.out -o "b main_start"
 dump:
 	objdump	-d a.out
